@@ -25,10 +25,15 @@ class VirtualPythonEnvironment:
         self._secrets = {}
 
         try:
-            subprocess.run([sys.executable, "-m", "venv", self.venv_path], check=True, capture_output=True)
+            # 1. Create the virtual environment
+            subprocess.run(
+                [sys.executable, "-m", "venv", self.venv_path],
+                check=True, capture_output=True, text=True
+            )
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Failed to create virtual environment: {e.stderr.decode()}")
+            raise RuntimeError(f"Failed to create virtual environment: {e.stderr}")
 
+        # 2. Define platform-specific executable paths
         if sys.platform == "win32":
             self.python_executable = os.path.join(self.venv_path, "Scripts", "python.exe")
             self.pip_executable = os.path.join(self.venv_path, "Scripts", "pip.exe")
@@ -36,6 +41,29 @@ class VirtualPythonEnvironment:
             self.python_executable = os.path.join(self.venv_path, "bin", "python")
             self.pip_executable = os.path.join(self.venv_path, "bin", "pip")
 
+        # --- NEW SECTION START ---
+        # 3. Upgrade pip and install common packages
+        try:
+            # Upgrade pip to the latest version
+            subprocess.run(
+                [self.pip_executable, "install", "--upgrade", "pip"],
+                check=True, capture_output=True, text=True
+            )
+            # Install a set of common libraries
+            common_packages = ["requests", "pandas", "numpy"]
+            subprocess.run(
+                [self.pip_executable, "install"] + common_packages,
+                check=True, capture_output=True, text=True
+            )
+        except subprocess.CalledProcessError as e:
+            # If installation fails, clean up the created directory and raise an error
+            shutil.rmtree(self.workdir, ignore_errors=True)
+            error_message = f"""
+            Failed to pre-install packages in the virtual environment.
+            COMMAND: {' '.join(e.cmd)}
+            STDERR: {e.stderr}
+            """
+            raise RuntimeError(error_message)
         self.state_file = os.path.join(self.workdir, "session_state.pkl")
 
     def __del__(self):
@@ -67,8 +95,18 @@ class VirtualPythonEnvironment:
 
     def execute_python(self, code: str) -> str:
         """Executes Python code within the virtual environment, maintaining state."""
-        runner_script = f"""
+        # Define a prelude to automatically import common libraries.
+        prelude_code = """\
+import pandas as pd
+import numpy as np
+import requests
+import os
+import sys
+"""
+
+        runner_script = f"""\
 import pickle, sys, types
+import _io
 
 state_file = r'{self.state_file}'
 _globals = {{}}
@@ -76,14 +114,25 @@ _globals = {{}}
 try:
     with open(state_file, 'rb') as f:
         _globals = pickle.load(f)
-except FileNotFoundError:
+except (FileNotFoundError, EOFError):
     pass
 
 _globals.update({self._secrets})
 
-user_code = '''
-{code}
-'''
+# --- MODIFIED SECTION START ---
+# Execute the prelude code first to load common modules
+try:
+    exec({repr(prelude_code)}, _globals)
+except Exception as e:
+    # This is a critical internal error, should be reported
+    import traceback
+    print("Error executing prelude code:", file=sys.stderr)
+    print(traceback.format_exc(), file=sys.stderr)
+
+# Now, define and execute the user's code
+user_code = {repr(code)}
+
+# --- MODIFIED SECTION END ---
 
 try:
     exec(user_code, _globals)
@@ -91,9 +140,10 @@ except Exception as e:
     import traceback
     print(traceback.format_exc(), file=sys.stderr)
 
-# Improved cleanup: Remove modules, functions, and other non-serializable types
+# More robust cleanup to remove common unpickleable types
 for key in list(_globals.keys()):
-    if key.startswith('__') or isinstance(_globals[key], (types.ModuleType, types.FunctionType)):
+    if (key.startswith('__') or
+            isinstance(_globals[key], (types.ModuleType, types.FunctionType, _io._IOBase))):
         del _globals[key]
 
 try:

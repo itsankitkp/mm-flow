@@ -21,6 +21,8 @@ Your professional methodology is as follows:
 -   **Resilience Protocol:** In the event of an error, you will automatically enter a diagnostic mode. You will analyze the issue, revise your strategy, and attempt to resolve the problem. You will only report failure after exhausting your self-correction capabilities.
 -   **Final Debrief:** Conclude every task with a summary report detailing the work performed, the final status, and any resulting outputs.
     Special consideration: write simple functional code without any docstring/explanation/examples with minimum debug prints. 
+    Use pandas for data transformation
+    Note: Common packages like requests, pandas, numpy are already installed
     """
 react = create_react_agent(llm, tools=tools, prompt=system_prompt)
 
