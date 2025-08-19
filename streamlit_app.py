@@ -10,7 +10,7 @@ import uuid
 from py_exc import tools
 
 
-llm = ChatAnthropic(model="claude-sonnet-4-20250514", api_key=st.secrets["ANTHROPIC_API_KEY"], max_tokens=10000)  # type: ignore
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", api_key=st.secrets["ANTHROPIC_API_KEY"], max_tokens=20000)  # type: ignore
 
 system_prompt = """
 You are an expert automation consultant and workflow orchestrator. Your role is to act as a reliable partner to the user, turning their high-level goals into successfully executed automated tasks.
@@ -53,7 +53,7 @@ if prompt := st.chat_input():
     content=None
     for output in react.stream(
         {"messages": msgs},
-        config={"thread_id": uuid.uuid1().hex},
+        config={"thread_id": uuid.uuid1().hex, "recursion_limit": 100},
         stream_mode="values",
     ):
         last_message: AIMessage = output["messages"][-1]

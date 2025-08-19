@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import shutil
+import types
 from typing import List, Callable
 
 # --- Core Class for the Isolated Python Environment ---
@@ -67,7 +68,7 @@ class VirtualPythonEnvironment:
     def execute_python(self, code: str) -> str:
         """Executes Python code within the virtual environment, maintaining state."""
         runner_script = f"""
-import pickle, sys
+import pickle, sys, types
 
 state_file = r'{self.state_file}'
 _globals = {{}}
@@ -78,7 +79,6 @@ try:
 except FileNotFoundError:
     pass
 
-# Inject secrets into the global scope
 _globals.update({self._secrets})
 
 user_code = '''
@@ -91,9 +91,9 @@ except Exception as e:
     import traceback
     print(traceback.format_exc(), file=sys.stderr)
 
-# Remove non-serializable items before saving
+# Improved cleanup: Remove modules, functions, and other non-serializable types
 for key in list(_globals.keys()):
-    if key.startswith('__') or callable(_globals[key]):
+    if key.startswith('__') or isinstance(_globals[key], (types.ModuleType, types.FunctionType)):
         del _globals[key]
 
 try:
