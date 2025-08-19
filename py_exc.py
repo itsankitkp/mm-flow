@@ -94,17 +94,18 @@ class VirtualPythonEnvironment:
             return f"Error executing command '{command}':\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}"
 
     def execute_python(self, code: str) -> str:
-        """Executes Python code within the virtual environment, maintaining state."""
-        # Define a prelude to automatically import common libraries.
-        prelude_code = """\
+        """
+        Executes Python code within the virtual environment, maintaining state with a robust,
+        dynamic pickling mechanism.
+        """
+        prelude_code = """
 import pandas as pd
 import numpy as np
 import requests
 import os
 import sys
 """
-
-        runner_script = f"""\
+        runner_script = f"""
 import pickle, sys, types
 import _io
 
@@ -119,20 +120,16 @@ except (FileNotFoundError, EOFError):
 
 _globals.update({self._secrets})
 
-# --- MODIFIED SECTION START ---
-# Execute the prelude code first to load common modules
 try:
     exec({repr(prelude_code)}, _globals)
 except Exception as e:
-    # This is a critical internal error, should be reported
     import traceback
     print("Error executing prelude code:", file=sys.stderr)
     print(traceback.format_exc(), file=sys.stderr)
 
-# Now, define and execute the user's code
-user_code = {repr(code)}
-
-# --- MODIFIED SECTION END ---
+user_code = '''
+{code}
+'''
 
 try:
     exec(user_code, _globals)
@@ -140,18 +137,28 @@ except Exception as e:
     import traceback
     print(traceback.format_exc(), file=sys.stderr)
 
-# More robust cleanup to remove common unpickleable types
-for key in list(_globals.keys()):
-    if (key.startswith('__') or
-            isinstance(_globals[key], (types.ModuleType, types.FunctionType, _io._IOBase))):
-        del _globals[key]
+
+# Instead of blacklisting types, we try to pickle every object and only keep
+# the ones that succeed. This is future-proof.
+serializable_globals = {{}}
+for key, value in _globals.items():
+    # Basic exclusion of modules, functions, and built-ins for efficiency
+    if key.startswith('__') or isinstance(value, (types.ModuleType, types.FunctionType)):
+        continue
+    try:
+        pickle.dumps(value) # The actual test
+        serializable_globals[key] = value
+    except (pickle.PicklingError, TypeError) as e:
+        # Optional: print a debug warning that a variable is being skipped
+        pass
 
 try:
     with open(state_file, 'wb') as f:
-        pickle.dump(_globals, f)
+        # We now dump the sanitized dictionary
+        pickle.dump(serializable_globals, f)
 except Exception as e:
     print(f"State saving error: {{e}}", file=sys.stderr)
-"""
+    """
         try:
             result = subprocess.run(
                 [self.python_executable, "-c", runner_script],
@@ -163,7 +170,6 @@ except Exception as e:
             return output if output else "Execution successful with no output."
         except subprocess.CalledProcessError as e:
             return f"An error occurred during Python execution:\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}"
-
     def save_code(self, filename: str, code: str) -> str:
         """Saves a string of code to a file inside the working directory."""
         try:
