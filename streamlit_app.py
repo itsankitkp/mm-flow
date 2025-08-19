@@ -58,9 +58,17 @@ if prompt := st.chat_input():
         stream_mode="values",
     ):
         last_message: AIMessage = output["messages"][-1]
-        print(last_message)
+        print(output["messages"])
+        
         if isinstance(last_message, ToolMessage):
-            continue
+            content = last_message.content
+            st.chat_message("assistant").write(content)
+            st.session_state.messages.append(
+                    {"role": "assistant", "content": content}
+                )
+
+
+
 
         if isinstance(last_message, AIMessage):
             try:
@@ -74,12 +82,26 @@ if prompt := st.chat_input():
                         st.session_state.messages.append(
                             {"role": "assistant", "content": content}
                         )
+
+                            
                 else:
                     content = last_message.content
                     st.chat_message("assistant").write(content)
                     st.session_state.messages.append(
                         {"role": "assistant", "content": content}
                     )
+                if hasattr(last_message, 'tool_calls'):
+                    tool_calls = last_message.tool_calls
+                    for tool_call in tool_calls:
+                        if tool_call['name'] == "execute_shell_command_in_env":
+                            msg=f"Running {tool_call['args']['command']}"
+                            st.session_state.messages.append(
+                        {"role": "assistant", "content": content}
+                    )   
+                        if tool_call['name'] == "execute_python_code_in_env":
+                            code = tool_call['args']['code']
+                            st.code(code, language="python")
+
             except Exception as e:
                 raise e
                 breakpoint()
