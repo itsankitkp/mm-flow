@@ -96,7 +96,7 @@ class VirtualPythonEnvironment:
     def execute_python(self, code: str) -> str:
         """
         Executes Python code within the virtual environment, maintaining state with a robust,
-        dynamic pickling mechanism.
+        dynamic pickling mechanism and safe code injection.
         """
         prelude_code = """
 import pandas as pd
@@ -105,11 +105,14 @@ import requests
 import os
 import sys
 """
-        runner_script = f"""
+    # --- THE FIX IS HERE ---
+    # The template is changed. We no longer wrap the user code in triple quotes.
+    # Instead, we will inject the "representation" of the code string.
+        runner_script_template = """
 import pickle, sys, types
 import _io
 
-state_file = r'{self.state_file}'
+state_file = r'{state_file_path}'
 _globals = {{}}
 
 try:
@@ -118,18 +121,17 @@ try:
 except (FileNotFoundError, EOFError):
     pass
 
-_globals.update({self._secrets})
+_globals.update({secrets})
 
 try:
-    exec({repr(prelude_code)}, _globals)
+    exec({prelude}, _globals)
 except Exception as e:
     import traceback
     print("Error executing prelude code:", file=sys.stderr)
     print(traceback.format_exc(), file=sys.stderr)
 
-user_code = '''
-{code}
-'''
+# The user's code is now assigned from its safe, escaped representation.
+user_code = {user_code_repr}
 
 try:
     exec(user_code, _globals)
@@ -137,28 +139,34 @@ except Exception as e:
     import traceback
     print(traceback.format_exc(), file=sys.stderr)
 
-
-# Instead of blacklisting types, we try to pickle every object and only keep
-# the ones that succeed. This is future-proof.
+# ... (The robust pickling logic remains the same) ...
 serializable_globals = {{}}
 for key, value in _globals.items():
-    # Basic exclusion of modules, functions, and built-ins for efficiency
     if key.startswith('__') or isinstance(value, (types.ModuleType, types.FunctionType)):
         continue
     try:
-        pickle.dumps(value) # The actual test
+        pickle.dumps(value)
         serializable_globals[key] = value
-    except (pickle.PicklingError, TypeError) as e:
-        # Optional: print a debug warning that a variable is being skipped
+    except (pickle.PicklingError, TypeError):
         pass
 
 try:
     with open(state_file, 'wb') as f:
-        # We now dump the sanitized dictionary
         pickle.dump(serializable_globals, f)
 except Exception as e:
+    # Note: The f-string here is safe because of the double-braces {{e}}
     print(f"State saving error: {{e}}", file=sys.stderr)
-    """
+"""
+
+        # We now use repr(code) to create the safe representation.
+        runner_script = runner_script_template.format(
+            state_file_path=self.state_file,
+            secrets=self._secrets,
+            prelude=repr(prelude_code),
+            user_code_repr=repr(code)  # <--- The key change is here
+        )
+        # --- END OF FIX ---
+
         try:
             result = subprocess.run(
                 [self.python_executable, "-c", runner_script],
@@ -170,6 +178,9 @@ except Exception as e:
             return output if output else "Execution successful with no output."
         except subprocess.CalledProcessError as e:
             return f"An error occurred during Python execution:\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}"
+
+
+
     def save_code(self, filename: str, code: str) -> str:
         """Saves a string of code to a file inside the working directory."""
         try:

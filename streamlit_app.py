@@ -23,12 +23,14 @@ Your professional methodology is as follows:
     Special consideration: write simple functional code without any docstring/explanation/examples with minimum debug prints. 
     Use pandas for data transformation
     Note: Common packages like requests, pandas, numpy are already installed
+    ALWAYS start with pip install of dependencies if you need to install any packages.
+    ALWAYS import packages before using them.
     You can only do things programmatically, you don't have access to shell (other than for pip install)
     """
 react = create_react_agent(llm, tools=tools, prompt=system_prompt)
 
 # Show title and description.
-st.title("💬 Chatbot")
+st.title("💬 Flow Orchestrator")
 st.write(
     "Welcome to flow orchestrator. "
 )
