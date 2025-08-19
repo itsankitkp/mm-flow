@@ -1,56 +1,88 @@
 import streamlit as st
 from openai import OpenAI
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+from langchain_experimental.tools.python.tool import PythonAstREPLTool
+from langchain_anthropic import ChatAnthropic
+from langgraph.prebuilt import create_react_agent
+
+import uuid
+from py_exc import tools
+
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", api_key=st.secrets["ANTHROPIC_API_KEY"], max_tokens=10000)  # type: ignore
+
+system_prompt = """
+You are an expert automation consultant and workflow orchestrator. Your role is to act as a reliable partner to the user, turning their high-level goals into successfully executed automated tasks.
+Your professional methodology is as follows:
+-   **Consultation Phase:** Begin every task by ensuring you have a crystal-clear understanding of the user's requirements. If any part of the request is vague, ask targeted questions to clarify scope, inputs, outputs, and any required credentials. A solid foundation prevents errors later.
+-   **Strategy Phase:** Based on the clarified requirements, develop and present a clear, step-by-step execution strategy. This demonstrates your understanding and allows for confirmation before you begin the work.
+-   **Execution Phase:** Implement the strategy using your powerful set of capabilities. You will operate within a dedicated, stateful environment, allowing you to perform complex, multi-step operations.
+-   **Resilience Protocol:** In the event of an error, you will automatically enter a diagnostic mode. You will analyze the issue, revise your strategy, and attempt to resolve the problem. You will only report failure after exhausting your self-correction capabilities.
+-   **Final Debrief:** Conclude every task with a summary report detailing the work performed, the final status, and any resulting outputs.
+    """
+react = create_react_agent(llm, tools=tools, prompt=system_prompt)
 
 # Show title and description.
 st.title("💬 Chatbot")
 st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
+    "Welcome to flow orchestrator. "
 )
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+if "messages" not in st.session_state:
+    st.session_state["messages"] = [
+        {"role": "assistant", "content": "Let me know your flow!"}
+    ]
+for msg in st.session_state.messages:
+    st.chat_message(msg["role"]).write(msg["content"])
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+if prompt := st.chat_input():
+    st.chat_message("user").write(prompt)
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    context = ""
+    msgs = []
+    for msg in st.session_state.messages:
+        if msg["role"] == "user":
+            msgs.append(HumanMessage(content=msg["content"]))
+        else:
+            msgs.append(AIMessage(content=msg["content"]))
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+    msgs.append(HumanMessage(content=prompt))
+    output = None
+    content=None
+    for output in react.stream(
+        {"messages": msgs},
+        config={"thread_id": uuid.uuid1().hex},
+        stream_mode="values",
+    ):
+        last_message: AIMessage = output["messages"][-1]
+        print(last_message)
+        if isinstance(last_message, ToolMessage):
+            continue
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        if isinstance(last_message, AIMessage):
+            try:
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+                # some hacks to seperate out tool call messages from AIMessage
+                if isinstance(last_message.content, list):
+                    if "text" in last_message.content[0]:
+                        content = last_message.content[0]["text"]
+                        st.chat_message("assistant").write(content)
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": content}
+                        )
+                else:
+                    content = last_message.content
+                    st.chat_message("assistant").write(content)
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": content}
+                    )
+            except Exception as e:
+                raise e
+                breakpoint()
+
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    if content:
+        st.session_state.messages.append({"role": "assistant", "content": content})
