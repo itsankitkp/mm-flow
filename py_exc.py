@@ -9,6 +9,7 @@ from typing import List, Callable
 
 # --- Core Class for the Isolated Python Environment ---
 
+
 class VirtualPythonEnvironment:
     """
     A class that provides a fully isolated, stateful Python execution environment.
@@ -18,6 +19,7 @@ class VirtualPythonEnvironment:
     environment, ensuring no dependency conflicts. State (variables) is maintained
     between Python executions by pickling the global scope.
     """
+
     def __init__(self):
         """Initializes the environment, creates a venv, and identifies python/pip paths."""
         self.workdir = tempfile.mkdtemp()
@@ -28,14 +30,18 @@ class VirtualPythonEnvironment:
             # 1. Create the virtual environment
             subprocess.run(
                 [sys.executable, "-m", "venv", self.venv_path],
-                check=True, capture_output=True, text=True
+                check=True,
+                capture_output=True,
+                text=True,
             )
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to create virtual environment: {e.stderr}")
 
         # 2. Define platform-specific executable paths
         if sys.platform == "win32":
-            self.python_executable = os.path.join(self.venv_path, "Scripts", "python.exe")
+            self.python_executable = os.path.join(
+                self.venv_path, "Scripts", "python.exe"
+            )
             self.pip_executable = os.path.join(self.venv_path, "Scripts", "pip.exe")
         else:
             self.python_executable = os.path.join(self.venv_path, "bin", "python")
@@ -47,13 +53,17 @@ class VirtualPythonEnvironment:
             # Upgrade pip to the latest version
             subprocess.run(
                 [self.pip_executable, "install", "--upgrade", "pip"],
-                check=True, capture_output=True, text=True
+                check=True,
+                capture_output=True,
+                text=True,
             )
             # Install a set of common libraries
             common_packages = ["requests", "pandas", "numpy"]
             subprocess.run(
                 [self.pip_executable, "install"] + common_packages,
-                check=True, capture_output=True, text=True
+                check=True,
+                capture_output=True,
+                text=True,
             )
         except subprocess.CalledProcessError as e:
             # If installation fails, clean up the created directory and raise an error
@@ -74,7 +84,9 @@ class VirtualPythonEnvironment:
         """Resolves a filename to its full, secure path within the working directory."""
         safe_path = os.path.normpath(os.path.join(self.workdir, filename))
         if not safe_path.startswith(self.workdir):
-            raise ValueError("File path must be within the designated working directory.")
+            raise ValueError(
+                "File path must be within the designated working directory."
+            )
         return safe_path
 
     def execute_shell(self, command: str) -> str:
@@ -84,11 +96,18 @@ class VirtualPythonEnvironment:
 
         try:
             result = subprocess.run(
-                command, shell=True, capture_output=True, text=True, check=True, cwd=self.workdir
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=self.workdir,
             )
             output = ""
-            if result.stdout: output += f"STDOUT:\n{result.stdout}\n"
-            if result.stderr: output += f"STDERR:\n{result.stderr}\n"
+            if result.stdout:
+                output += f"STDOUT:\n{result.stdout}\n"
+            if result.stderr:
+                output += f"STDERR:\n{result.stderr}\n"
             return output if output else "Command executed successfully with no output."
         except subprocess.CalledProcessError as e:
             return f"Error executing command '{command}':\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}"
@@ -96,7 +115,7 @@ class VirtualPythonEnvironment:
     def execute_python(self, code: str) -> str:
         """
         Executes Python code within the virtual environment, maintaining state with a robust,
-        dynamic pickling mechanism.
+        dynamic pickling mechanism and safe code injection.
         """
         prelude_code = """
 import pandas as pd
@@ -105,11 +124,14 @@ import requests
 import os
 import sys
 """
-        runner_script = f"""
+        # --- THE FIX IS HERE ---
+        # The template is changed. We no longer wrap the user code in triple quotes.
+        # Instead, we will inject the "representation" of the code string.
+        runner_script_template = """
 import pickle, sys, types
 import _io
 
-state_file = r'{self.state_file}'
+state_file = r'{state_file_path}'
 _globals = {{}}
 
 try:
@@ -118,18 +140,17 @@ try:
 except (FileNotFoundError, EOFError):
     pass
 
-_globals.update({self._secrets})
+_globals.update({secrets})
 
 try:
-    exec({repr(prelude_code)}, _globals)
+    exec({prelude}, _globals)
 except Exception as e:
     import traceback
     print("Error executing prelude code:", file=sys.stderr)
     print(traceback.format_exc(), file=sys.stderr)
 
-user_code = '''
-{code}
-'''
+# The user's code is now assigned from its safe, escaped representation.
+user_code = {user_code_repr}
 
 try:
     exec(user_code, _globals)
@@ -137,44 +158,55 @@ except Exception as e:
     import traceback
     print(traceback.format_exc(), file=sys.stderr)
 
-
-# Instead of blacklisting types, we try to pickle every object and only keep
-# the ones that succeed. This is future-proof.
+# ... (The robust pickling logic remains the same) ...
 serializable_globals = {{}}
 for key, value in _globals.items():
-    # Basic exclusion of modules, functions, and built-ins for efficiency
     if key.startswith('__') or isinstance(value, (types.ModuleType, types.FunctionType)):
         continue
     try:
-        pickle.dumps(value) # The actual test
+        pickle.dumps(value)
         serializable_globals[key] = value
-    except (pickle.PicklingError, TypeError) as e:
-        # Optional: print a debug warning that a variable is being skipped
+    except (pickle.PicklingError, TypeError):
         pass
 
 try:
     with open(state_file, 'wb') as f:
-        # We now dump the sanitized dictionary
         pickle.dump(serializable_globals, f)
 except Exception as e:
+    # Note: The f-string here is safe because of the double-braces {{e}}
     print(f"State saving error: {{e}}", file=sys.stderr)
-    """
+"""
+
+        # We now use repr(code) to create the safe representation.
+        runner_script = runner_script_template.format(
+            state_file_path=self.state_file,
+            secrets=self._secrets,
+            prelude=repr(prelude_code),
+            user_code_repr=repr(code),  # <--- The key change is here
+        )
+
         try:
             result = subprocess.run(
                 [self.python_executable, "-c", runner_script],
-                capture_output=True, text=True, check=True, cwd=self.workdir
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=self.workdir,
             )
             output = ""
-            if result.stdout: output += f"STDOUT:\n{result.stdout}\n"
-            if result.stderr: output += f"STDERR:\n{result.stderr}\n"
+            if result.stdout:
+                output += f"STDOUT:\n{result.stdout}\n"
+            if result.stderr:
+                output += f"STDERR:\n{result.stderr}\n"
             return output if output else "Execution successful with no output."
         except subprocess.CalledProcessError as e:
             return f"An error occurred during Python execution:\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}"
+
     def save_code(self, filename: str, code: str) -> str:
         """Saves a string of code to a file inside the working directory."""
         try:
             full_path = self._resolve_path(filename)
-            with open(full_path, 'w') as f:
+            with open(full_path, "w") as f:
                 f.write(code)
             return f"Code successfully saved to '{filename}' in the working directory."
         except Exception as e:
@@ -184,18 +216,20 @@ except Exception as e:
         """Reads and executes a script from the working directory."""
         try:
             full_path = self._resolve_path(filename)
-            with open(full_path, 'r') as f:
+            with open(full_path, "r") as f:
                 script_code = f.read()
             return self.execute_python(script_code)
         except FileNotFoundError:
-            return f"Error: The file '{filename}' was not found in the working directory."
+            return (
+                f"Error: The file '{filename}' was not found in the working directory."
+            )
         except Exception as e:
             return f"An error occurred: {e}"
 
     def list_files(self) -> str:
         """Lists all files in the current working directory, excluding the venv."""
         try:
-            files = [f for f in os.listdir(self.workdir) if f != 'venv']
+            files = [f for f in os.listdir(self.workdir) if f != "venv"]
             if not files:
                 return "The working directory is empty."
             return f"Files in the working directory: {files}"
@@ -211,13 +245,16 @@ except Exception as e:
 
     def list_secrets(self) -> str:
         """Lists the keys of the secrets that have been set."""
-        if not self._secrets: return "No secrets are currently set."
+        if not self._secrets:
+            return "No secrets are currently set."
         return f"Available secrets (keys only): {list(self._secrets.keys())}"
+
 
 # --- Create a single, persistent instance for the entire workflow ---
 isolated_env = VirtualPythonEnvironment()
 
 # --- Tool Helper Functions for the LLM Agent ---
+
 
 def execute_shell_command_in_env(command: str) -> str:
     """
@@ -234,6 +271,7 @@ def execute_shell_command_in_env(command: str) -> str:
     """
     return isolated_env.execute_shell(command)
 
+
 def execute_python_code_in_env(code: str) -> str:
     """
     Executes a block of Python code in a persistent, stateful, and isolated environment.
@@ -249,6 +287,7 @@ def execute_python_code_in_env(code: str) -> str:
     """
     return isolated_env.execute_python(code)
 
+
 def save_code_to_file_in_env(filename: str, code: str) -> str:
     """
     Saves a string of Python code to a script file in the session's working directory.
@@ -263,6 +302,7 @@ def save_code_to_file_in_env(filename: str, code: str) -> str:
     """
     return isolated_env.save_code(filename, code)
 
+
 def run_python_script_in_env(filename: str) -> str:
     """
     Reads and executes a Python script from the session's working directory.
@@ -276,6 +316,7 @@ def run_python_script_in_env(filename: str) -> str:
     """
     return isolated_env.run_script(filename)
 
+
 def list_files_in_workdir() -> str:
     """
     Lists all the files currently in the session's temporary working directory.
@@ -285,6 +326,7 @@ def list_files_in_workdir() -> str:
         str: A string containing the list of filenames.
     """
     return isolated_env.list_files()
+
 
 def set_secret_variable_in_env(key: str, value: str) -> str:
     """
@@ -301,6 +343,7 @@ def set_secret_variable_in_env(key: str, value: str) -> str:
     """
     return isolated_env.set_secret(key, value)
 
+
 def list_available_secrets() -> str:
     """
     Lists the names of secrets that have been set for the current session.
@@ -310,6 +353,7 @@ def list_available_secrets() -> str:
         str: A string containing the list of available secret keys.
     """
     return isolated_env.list_secrets()
+
 
 # --- List of Tools for Agent Integration ---
 
