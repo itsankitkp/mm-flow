@@ -5,19 +5,15 @@ import sys
 import tempfile
 import shutil
 import types
-from typing import List, Callable
-
-# --- Core Class for the Isolated Python Environment ---
+import inspect
+import json
+from typing import List, Callable, Any
+from pathlib import Path
 
 
 class VirtualPythonEnvironment:
     """
     A class that provides a fully isolated, stateful Python execution environment.
-
-    Each instance creates its own virtual environment (`venv`) in a temporary directory.
-    All shell commands and Python code are executed exclusively within this isolated
-    environment, ensuring no dependency conflicts. State (variables) is maintained
-    between Python executions by pickling the global scope.
     """
 
     def __init__(self):
@@ -26,8 +22,12 @@ class VirtualPythonEnvironment:
         self.venv_path = os.path.join(self.workdir, "venv")
         self._secrets = {}
 
+        # Directory for injected modules
+        self.modules_dir = os.path.join(self.workdir, "injected_modules")
+        os.makedirs(self.modules_dir, exist_ok=True)
+
         try:
-            # 1. Create the virtual environment
+            # Create the virtual environment
             subprocess.run(
                 [sys.executable, "-m", "venv", self.venv_path],
                 check=True,
@@ -37,7 +37,7 @@ class VirtualPythonEnvironment:
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to create virtual environment: {e.stderr}")
 
-        # 2. Define platform-specific executable paths
+        # Define platform-specific executable paths
         if sys.platform == "win32":
             self.python_executable = os.path.join(
                 self.venv_path, "Scripts", "python.exe"
@@ -47,17 +47,14 @@ class VirtualPythonEnvironment:
             self.python_executable = os.path.join(self.venv_path, "bin", "python")
             self.pip_executable = os.path.join(self.venv_path, "bin", "pip")
 
-        # --- NEW SECTION START ---
-        # 3. Upgrade pip and install common packages
+        # Upgrade pip and install common packages
         try:
-            # Upgrade pip to the latest version
             subprocess.run(
                 [self.pip_executable, "install", "--upgrade", "pip"],
                 check=True,
                 capture_output=True,
                 text=True,
             )
-            # Install a set of common libraries
             common_packages = ["requests", "pandas", "numpy"]
             subprocess.run(
                 [self.pip_executable, "install"] + common_packages,
@@ -66,33 +63,69 @@ class VirtualPythonEnvironment:
                 text=True,
             )
         except subprocess.CalledProcessError as e:
-            # If installation fails, clean up the created directory and raise an error
             shutil.rmtree(self.workdir, ignore_errors=True)
-            error_message = f"""
-            Failed to pre-install packages in the virtual environment.
-            COMMAND: {' '.join(e.cmd)}
-            STDERR: {e.stderr}
-            """
-            raise RuntimeError(error_message)
+            raise RuntimeError(f"Failed to pre-install packages: {e.stderr}")
+
         self.state_file = os.path.join(self.workdir, "session_state.pkl")
+        self.imports_cache = os.path.join(self.workdir, "imports_cache.json")
 
     def __del__(self):
         """Ensures the entire temporary directory (including the venv) is cleaned up."""
         shutil.rmtree(self.workdir, ignore_errors=True)
 
+    def add_module(self, module):
+        """
+        Inject a Python module into the virtual environment.
+
+        Args:
+            module: A Python module object or path to a .py file
+        """
+        if isinstance(module, str) and os.path.isfile(module):
+            # It's a file path
+            module_name = os.path.splitext(os.path.basename(module))[0]
+            target_path = os.path.join(self.modules_dir, f"{module_name}.py")
+            shutil.copy2(module, target_path)
+            return f"Module '{module_name}' added from file"
+
+        if not inspect.ismodule(module):
+            raise ValueError("Argument must be a module object or file path")
+
+        module_name = module.__name__.split(".")[
+            -1
+        ]  # Get the last part of the module name
+        module_file = os.path.join(self.modules_dir, f"{module_name}.py")
+
+        try:
+            # Try to get the source code
+            source = inspect.getsource(module)
+            with open(module_file, "w") as f:
+                f.write(source)
+        except (OSError, TypeError):
+            # If we can't get source (e.g., built-in module), try to get from file
+            if hasattr(module, "__file__") and module.__file__:
+                if module.__file__.endswith(".py"):
+                    shutil.copy2(module.__file__, module_file)
+                else:
+                    raise ValueError(f"Cannot extract source from module {module_name}")
+            else:
+                raise ValueError(f"Cannot extract source from module {module_name}")
+
+        return f"Module '{module_name}' injected successfully"
+
     def _resolve_path(self, filename: str) -> str:
         """Resolves a filename to its full, secure path within the working directory."""
         safe_path = os.path.normpath(os.path.join(self.workdir, filename))
         if not safe_path.startswith(self.workdir):
-            raise ValueError(
-                "File path must be within the designated working directory."
-            )
+            raise ValueError("File path must be within the working directory.")
         return safe_path
 
     def execute_shell(self, command: str) -> str:
         """Executes a shell command within the virtual environment."""
         if command.strip().startswith("pip "):
             command = command.replace("pip", self.pip_executable, 1)
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = f"{self.modules_dir}:{self.workdir}"
 
         try:
             result = subprocess.run(
@@ -102,6 +135,7 @@ class VirtualPythonEnvironment:
                 text=True,
                 check=True,
                 cwd=self.workdir,
+                env=env,
             )
             output = ""
             if result.stdout:
@@ -114,76 +148,129 @@ class VirtualPythonEnvironment:
 
     def execute_python(self, code: str) -> str:
         """
-        Executes Python code within the virtual environment, maintaining state with a robust,
-        dynamic pickling mechanism and safe code injection.
+        Executes Python code within the virtual environment, maintaining state.
         """
-        prelude_code = """
+        # Add the modules directory to sys.path in the prelude
+        prelude_code = f"""
+import sys
+sys.path.insert(0, r'{self.modules_dir}')
+sys.path.insert(0, r'{self.workdir}')
+
 import pandas as pd
 import numpy as np
 import requests
 import os
-import sys
+
+# Load cached imports
+import json
+try:
+    with open(r'{self.imports_cache}', 'r') as f:
+        _imports = json.load(f).get('imports', [])
+        for imp in _imports:
+            try:
+                exec(imp)
+            except:
+                pass
+except:
+    pass
 """
-        # --- THE FIX IS HERE ---
-        # The template is changed. We no longer wrap the user code in triple quotes.
-        # Instead, we will inject the "representation" of the code string.
+
         runner_script_template = """
 import pickle, sys, types
-import _io
+import json
+import ast
 
 state_file = r'{state_file_path}'
+imports_cache = r'{imports_cache_path}'
 _globals = {{}}
 
+# Load previous state (variables only, not modules)
 try:
     with open(state_file, 'rb') as f:
-        _globals = pickle.load(f)
-except (FileNotFoundError, EOFError):
+        _saved = pickle.load(f)
+        for k, v in _saved.items():
+            if not isinstance(v, (types.ModuleType, types.FunctionType, type)):
+                _globals[k] = v
+except:
     pass
 
 _globals.update({secrets})
 
-try:
-    exec({prelude}, _globals)
-except Exception as e:
-    import traceback
-    print("Error executing prelude code:", file=sys.stderr)
-    print(traceback.format_exc(), file=sys.stderr)
+# Execute prelude
+exec({prelude}, _globals)
 
-# The user's code is now assigned from its safe, escaped representation.
+# Track imports in user code
 user_code = {user_code_repr}
+_new_imports = []
+try:
+    tree = ast.parse(user_code)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                stmt = f"import {{alias.name}}"
+                if alias.asname:
+                    stmt += f" as {{alias.asname}}"
+                _new_imports.append(stmt)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                items = ", ".join([
+                    f"{{n.name}}" + (f" as {{n.asname}}" if n.asname else "")
+                    for n in node.names
+                ])
+                _new_imports.append(f"from {{node.module}} import {{items}}")
+except:
+    pass
 
+# Execute user code
 try:
     exec(user_code, _globals)
 except Exception as e:
     import traceback
     print(traceback.format_exc(), file=sys.stderr)
 
-# ... (The robust pickling logic remains the same) ...
+# Save new imports
+if _new_imports:
+    try:
+        with open(imports_cache, 'r') as f:
+            cache = json.load(f)
+    except:
+        cache = {{'imports': []}}
+    
+    for imp in _new_imports:
+        if imp not in cache['imports']:
+            cache['imports'].append(imp)
+    
+    with open(imports_cache, 'w') as f:
+        json.dump(cache, f)
+
+# Save state (only serializable non-module objects)
 serializable_globals = {{}}
 for key, value in _globals.items():
-    if key.startswith('__') or isinstance(value, (types.ModuleType, types.FunctionType)):
+    if key.startswith('_') or isinstance(value, (types.ModuleType, types.FunctionType, type)):
         continue
     try:
         pickle.dumps(value)
         serializable_globals[key] = value
-    except (pickle.PicklingError, TypeError):
-        pass
+    except:
+        continue
 
 try:
     with open(state_file, 'wb') as f:
         pickle.dump(serializable_globals, f)
 except Exception as e:
-    # Note: The f-string here is safe because of the double-braces {{e}}
-    print(f"State saving error: {{e}}", file=sys.stderr)
+    print(f"Warning: Could not save state: {{e}}", file=sys.stderr)
 """
 
-        # We now use repr(code) to create the safe representation.
         runner_script = runner_script_template.format(
             state_file_path=self.state_file,
+            imports_cache_path=self.imports_cache,
             secrets=self._secrets,
             prelude=repr(prelude_code),
-            user_code_repr=repr(code),  # <--- The key change is here
+            user_code_repr=repr(code),
         )
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = f"{self.modules_dir}:{self.workdir}"
 
         try:
             result = subprocess.run(
@@ -192,6 +279,7 @@ except Exception as e:
                 text=True,
                 check=True,
                 cwd=self.workdir,
+                env=env,
             )
             output = ""
             if result.stdout:
@@ -227,9 +315,19 @@ except Exception as e:
             return f"An error occurred: {e}"
 
     def list_files(self) -> str:
-        """Lists all files in the current working directory, excluding the venv."""
+        """Lists all files in the current working directory."""
         try:
-            files = [f for f in os.listdir(self.workdir) if f != "venv"]
+            files = [
+                f
+                for f in os.listdir(self.workdir)
+                if f
+                not in [
+                    "venv",
+                    "injected_modules",
+                    "session_state.pkl",
+                    "imports_cache.json",
+                ]
+            ]
             if not files:
                 return "The working directory is empty."
             return f"Files in the working directory: {files}"
@@ -250,113 +348,144 @@ except Exception as e:
         return f"Available secrets (keys only): {list(self._secrets.keys())}"
 
 
-# --- Create a single, persistent instance for the entire workflow ---
+# --- Create a single, persistent instance ---
 isolated_env = VirtualPythonEnvironment()
 
-# --- Tool Helper Functions for the LLM Agent ---
 
-
+# --- Tool Helper Functions ---
 def execute_shell_command_in_env(command: str) -> str:
     """
-    Executes a shell command within a dedicated, isolated environment.
-    Use this for installing dependencies (e.g., 'pip install pandas'), managing files,
-    or running any other command-line tool. All installations are temporary and
-    isolated to the current session.
+    Execute a shell command within the isolated virtual environment.
+    Use this for installing packages (e.g., 'pip install package_name'),
 
     Args:
-        command (str): The shell command to execute (e.g., 'pip install requests').
-
+        command (str): The shell command to execute (e.g., 'pip install requests', 'ls -la')
     Returns:
-        str: The standard output and standard error from the command.
+        str: Combined stdout and stderr output from the command execution
+
+    Examples:
+        >>> execute_shell_command_in_env("pip install beautifulsoup4")
     """
     return isolated_env.execute_shell(command)
 
 
 def execute_python_code_in_env(code: str) -> str:
     """
-    Executes a block of Python code in a persistent, stateful, and isolated environment.
-    Data-type variables (strings, lists, dicts, etc.) created in one execution will be
-    available in the next. This environment is separate from the host; libraries must be
-    installed first using `execute_shell_command_in_env`.
+    Execute Python code in a persistent, stateful, isolated environment.
+    Variables, imports, and objects created in one execution persist to the next.
 
     Args:
-        code (str): A string of valid Python code to execute.
+        code (str): Python code to execute as a string
 
     Returns:
-        str: The standard output and standard error from the execution.
+        str: Combined stdout and stderr from the code execution
+
+    Examples:
+        >>> execute_python_code_in_env("from serv import OAuthCallbackServer"
     """
     return isolated_env.execute_python(code)
 
 
 def save_code_to_file_in_env(filename: str, code: str) -> str:
     """
-    Saves a string of Python code to a script file in the session's working directory.
-    This is useful for creating reusable scripts that can be executed later with
-    `run_python_script_in_env`.
-
+    Save code to a file in the isolated environment's working directory.
     Args:
-        filename (str): The name of the file to save (e.g., 'my_script.py').
+        filename (str): Name of the file to create
+        code (str): Content to write to the file
 
     Returns:
-        str: A confirmation message.
+        str: Confirmation message or error description
+
+    Examples:
+        >>> save_code_to_file_in_env("utils.py", "def greet(name): return f'Hello {name}'")
     """
     return isolated_env.save_code(filename, code)
 
 
 def run_python_script_in_env(filename: str) -> str:
     """
-    Reads and executes a Python script from the session's working directory.
-    Use `list_files_in_workdir` to see available scripts.
+    Execute a Python script file from the environment's working directory.
+
+    Reads and executes a .py file that was previously saved using save_code_to_file_in_env().
+    The script runs in the same persistent environment, accessing all variables and imports.
 
     Args:
-        filename (str): The name of the Python script file to be executed.
+        filename (str): Name of the Python script file to execute
 
     Returns:
-        str: The standard output and standard error from the script's execution.
+        str: Combined stdout and stderr from script execution
+
+    Examples:
+        >>> save_code_to_file_in_env("test.py", "print('Hello from script')")
+        >>> run_python_script_in_env("test.py")
     """
     return isolated_env.run_script(filename)
 
 
 def list_files_in_workdir() -> str:
     """
-    Lists all the files currently in the session's temporary working directory.
-    This allows the agent to see what scripts or data files it has created.
+    List all files in the environment's working directory.
+
+    Shows files created by the agent, excluding system files like the venv,
+    state files, and module directories. Useful for checking what scripts
+    or data files have been created.
 
     Returns:
-        str: A string containing the list of filenames.
+        str: List of filenames or a message if directory is empty
+
+    Examples:
+        >>> list_files_in_workdir()
+        'Files in the working directory: ["script.py", "data.json", "output.txt"]'
     """
     return isolated_env.list_files()
 
 
 def set_secret_variable_in_env(key: str, value: str) -> str:
     """
-    Stores a secret (e.g., API key) as a variable for use in Python code execution.
-    The secret is only stored in memory and is injected into the Python environment
-    at runtime, making it available as a global variable.
+    Store a secret (e.g., API key, password) as a variable in the environment.
+
+    Secrets are injected as global variables in Python executions, allowing
+    secure use of sensitive data without hardcoding. Secrets are only stored
+    in memory for this session.
 
     Args:
-        key (str): The name of the variable the secret will be assigned to.
-        value (str): The actual secret value.
+        key (str): Variable name for the secret (must be valid Python identifier)
+        value (str): The secret value to store
 
     Returns:
-        str: A confirmation message.
+        str: Confirmation message or error if key is invalid
+
+    Examples:
+        >>> set_secret_variable_in_env("API_KEY", "sk-abc123...")
+        >>> execute_python_code_in_env("print(f'Using key: {API_KEY[:10]}...')")
     """
     return isolated_env.set_secret(key, value)
 
 
 def list_available_secrets() -> str:
     """
-    Lists the names of secrets that have been set for the current session.
-    This function does NOT display the actual secret values.
+    List the names of all secrets stored in the environment.
+
+    Only shows the variable names, not the actual secret values.
+    Useful for checking what secrets are available for use in code.
 
     Returns:
-        str: A string containing the list of available secret keys.
+        str: List of secret variable names or message if none are set
+
+    Examples:
+        >>> set_secret_variable_in_env("API_KEY", "secret123")
+        >>> list_available_secrets()
+        'Available secrets (keys only): ["API_KEY"]'
     """
     return isolated_env.list_secrets()
 
 
-# --- List of Tools for Agent Integration ---
+import serv
 
+isolated_env.add_module(serv)
+
+
+# List of tools for agent
 tools: List[Callable[..., str]] = [
     execute_shell_command_in_env,
     execute_python_code_in_env,

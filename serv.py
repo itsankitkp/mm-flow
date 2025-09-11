@@ -48,7 +48,9 @@ class OAuthCallbackServer:
         result = server.grant_consent(connector.consent_handler, timeout=120, expected_state="abc123")
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 8080, path: str = "/callback"):
+    def __init__(
+        self, host: str = "127.0.0.1", port: int = 8080, path: str = "/callback"
+    ):
         self.host = host
         self.port = port
         self.path = path
@@ -58,13 +60,15 @@ class OAuthCallbackServer:
         httpd.expected_path = self.path
         httpd.query = None
         return httpd
-    
+
     @property
     def redirect_uri(self) -> str:
         """Computed redirect URI (readable before server.start)."""
         return f"http://{self.host}:{self.port}{self.path}"
-    
-    def grant_consent(self, consent_handler, timeout: int = 120, expected_state: str = None):
+
+    def grant_consent(
+        self, consent_handler, timeout: int = 120, expected_state: str = None
+    ):
         """
         Start the server and wait for one redirect to `path`. When received, call:
             consent_handler(parsed_params: dict) -> any
@@ -80,7 +84,9 @@ class OAuthCallbackServer:
             TypeError if consent_handler isn't callable.
         """
         if not callable(consent_handler):
-            raise TypeError("consent_handler must be callable and accept one argument (params dict)")
+            raise TypeError(
+                "consent_handler must be callable and accept one argument (params dict)"
+            )
 
         server = self._make_server()
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -93,7 +99,9 @@ class OAuthCallbackServer:
                     break
                 time.sleep(0.2)
             else:
-                raise TimeoutError(f"No callback received at http://{self.host}:{self.port}{self.path} within {timeout}s")
+                raise TimeoutError(
+                    f"No callback received at http://{self.host}:{self.port}{self.path} within {timeout}s"
+                )
 
             params = server.query  # normalized dict (single values are plain strings)
 
