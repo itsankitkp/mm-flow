@@ -1,5 +1,18 @@
+import typing
+
+try:
+    # If NotRequired is missing (Python < 3.11), patch it from typing_extensions
+    from typing_extensions import NotRequired
+    typing.NotRequired = NotRequired
+except ImportError:
+    pass  # typing_extensions not installed → pip install typing_extensions
+
+
+
+
 import datetime
 import re
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 import streamlit as st
 from openai import OpenAI
@@ -8,12 +21,15 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_experimental.tools.python.tool import PythonAstREPLTool
 from langchain_anthropic import ChatAnthropic
 from langgraph.prebuilt import create_react_agent
-
+from langmem.short_term import SummarizationNode, RunningSummary
+from langchain_core.messages.utils import count_tokens_approximately
 import uuid
 from py_exc import tools
 from upload import upload_file_to_mammoth
+from langgraph.prebuilt.chat_agent_executor import AgentState
 
 llm = ChatAnthropic(model="claude-sonnet-4-20250514", api_key=st.secrets["ANTHROPIC_API_KEY"], max_tokens=20000)  # type: ignore
+#llm = ChatOpenAI(model="gpt-5", api_key=st.secrets["OPENAI_API_KEY"])
 
 
 class ResearchResult(BaseModel):
@@ -45,7 +61,17 @@ def web_search(query: str) -> ResearchResult:
 
 
 tools.append(web_search)
+model = ChatOpenAI(model="gpt-5-mini", api_key=st.secrets["OPENAI_API_KEY"])
 
+summarization_node = SummarizationNode( 
+    token_counter=count_tokens_approximately,
+    model=model,
+    max_tokens=368,
+    max_summary_tokens=140,
+    output_messages_key="llm_input_messages",
+)
+class State(AgentState):
+    context: dict[str, RunningSummary] 
 
 today_date = datetime.datetime.now().isoformat()
 
@@ -321,7 +347,128 @@ PAGE_SIZE = 100            # Number of records per API call (max: 100)
 
 Remember: The goal is to create a script that a user can immediately understand and configure without needing to research the API documentation themselves. Your comments and placeholders should serve as a complete guide.
 """
-react = create_react_agent(llm, tools=tools, prompt=system_prompt)
+
+
+
+
+system_prompt = """
+You are an expert OAuth2 integration engineer tasked with creating a universal Connector class for any OAuth2 provider. Your goal is to generate Python code that implements the OAuth2 authorization code flow for a specific connector type, using the provided client_id, client_secret, and redirect_uri.
+
+Inputs provided in the user prompt:
+- connector_type: The name of the OAuth2 provider (e.g., 'salesforce', 'personio', 'xero').
+- client_id: The OAuth2 client ID for the provider.
+- client_secret: The OAuth2 client secret for the provider (if required by the flow).
+- redirect_uri: The callback URI for the OAuth2 flow, provided by the user.
+
+Steps to follow strictly:
+
+1. **Research the Provider's OAuth2 Documentation:**
+   - Use the web_search or browse_page tools to find the official OAuth2 documentation for the connector_type.
+   - Identify key elements: authorization endpoint, token endpoint, supported scopes (define a default set based on common use cases), redirect URI requirements, and any provider-specific parameters.
+   - Confirm if the provider uses Authorization Code Flow with PKCE or standard client secret. If PKCE is required, adjust accordingly, but prioritize standard flow with client secret if supported.
+   - Note any unique requirements, such as specific headers, query params, authentication methods (e.g., Basic Auth for client credentials), error handling, or refresh token rotation.
+   - For scopes, research and select a reasonable default set including 'offline_access' if supported for refresh tokens.
+   - Pay special attention to how client authentication is handled in the token request: whether to include client_id in the body when using Basic Auth, or omit it. Follow provider-specific examples if available.
+
+2. **Generate the Connector Class:**
+   - Expose a class named Connector.
+   - The class must follow this exact structure for methods and arguments:
+     class Connector:
+         def __init__(self, client_id: str, client_secret: str = None, redirect_uri: str = ''):
+             # Set client_id, client_secret, redirect_uri
+             # Define provider-specific auth_endpoint, token_endpoint
+             # Define default_scopes as a list
+             # Initialize access_token, refresh_token, expires_in to None
+
+         def get_auth_url(self, state: str, scopes: list = None) -> str:
+             # Use self.redirect_uri
+             # Generate auth URL using urlencode
+             # Use default_scopes if scopes is None
+             # Include response_type='code', client_id, redirect_uri, scope (space-joined), state
+
+         def consent_handler(self, params: dict) -> dict:
+             # Extract 'code', 'state', 'error' from params
+             # If error, raise or return error dict
+             # If no code, raise or return error
+             # Call _exchange_code_for_token(auth_code)
+             # Handle exceptions and return error dict if needed
+
+         def _exchange_code_for_token(self, auth_code: str) -> dict:
+             # Use self.redirect_uri
+             # Prepare token_data with grant_type='authorization_code', code, redirect_uri
+             # If not self.client_secret, add 'client_id': self.client_id to token_data
+             # Headers with Content-Type='application/x-www-form-urlencoded'
+             # If client_secret, use Basic Auth: base64 encode client_id:client_secret, set Authorization header
+             # POST to token_endpoint with data=token_data, headers=headers
+             # If 200, parse json, store access_token, refresh_token, expires_in internally
+             # Return token dict
+             # Handle errors, return error dict
+
+         def refresh_access_token(self, refresh_token_value: str = None) -> dict:
+             # Use stored refresh_token if refresh_token_value is None
+             # If no refresh_token, return error
+             # Prepare token_data with grant_type='refresh_token', refresh_token
+             # If not self.client_secret, add 'client_id': self.client_id to token_data
+             # Same headers logic as _exchange_code_for_token (Basic Auth if client_secret)
+             # POST to token_endpoint
+             # If 200, update stored tokens (handle refresh token rotation if new refresh_token provided)
+             # Return new token dict
+             # Handle errors
+
+         def get_stored_tokens(self) -> dict:
+             # Return dict with access_token, refresh_token, expires_in
+
+   - Store redirect_uri from __init__ and use it in get_auth_url and _exchange_code_for_token.
+   - Use the requests library for HTTP requests; import requests, from urllib.parse import urlencode, import base64, import json.
+   - Store tokens internally in the instance.
+   - Handle common errors like invalid code, network issues, JSON decode errors.
+   - Adapt to provider specifics, e.g., if PKCE is required, add code_challenge etc., but keep method signatures identical.
+   - For authentication in token requests, prefer Basic Auth if client_secret is provided, and only include client_id in the body if no client_secret or if the provider documentation specifically requires it.
+
+3. **Test the Generated Code:**
+   - Since you can't run real OAuth flows, simulate by printing sample auth URL and mocking the token exchange.
+   - Use the code_execution tool to execute sample instantiation and method calls, e.g.:
+     connector = Connector(client_id='sample_id', client_secret='sample_secret', redirect_uri='http://localhost:8080/callback')
+     auth_url = connector.get_auth_url(state='abc123')
+     print(auth_url)
+     sample_params = {'code': 'mock_code', 'state': 'abc123'}
+     result = connector.consent_handler(sample_params)
+     print(result)
+     # Also test refresh
+     refresh_result = connector.refresh_access_token('mock_refresh')
+     print(refresh_result)
+     tokens = connector.get_stored_tokens()
+     print(tokens)
+   - Assume mock responses for testing (e.g., mock requests.post to return sample JSON).
+
+4. **Output Format:**
+   - First, output the full Python code for the Connector class, including necessary imports.
+   - Then, output test results from code_execution.
+   - Ensure the code is self-contained, import necessary modules.
+   - Do not use external libraries beyond requests, base64, urlencode, json (assume available).
+
+The Connector must integrate with this usage pattern:
+from serv import *
+server = OAuthCallbackServer(host="localhost", port=8080)
+connector = Connector(client_id="", client_secret="", redirect_uri=server.redirect_uri)
+state= uuid4()
+auth_url = connector.get_auth_url(state)
+print("Go to the following URL in your browser to authorize:", auth_url)
+result = server.grant_consent(connector.consent_handler, timeout=120, expected_state=state)
+print(result)
+
+This means consent_handler is a bound method that takes params dict and performs the code-to-token exchange. The redirect_uri is provided at initialization and used throughout the class. State is generated externally using uuid.uuid4().
+
+Think step-by-step, use tools as needed, and provide reasoned code.
+"""
+
+
+
+
+react = create_react_agent(llm, tools=tools,    
+    #                        pre_model_hook=summarization_node, 
+    # state_schema=State, 
+    prompt=system_prompt)
 
 
 # Show title and description.
