@@ -89,6 +89,7 @@ Search: "[service] API documentation 2025", "[service] authentication"
 Find: endpoints, auth methods, pagination, rate limits, required parameters
 
 **Auth Priority: No auth > API Key > Basic Auth > OAuth2**
+Get all credentials like access key, client ID/secret, before hand
 
 ### 3. Get Authentication Details
 
@@ -152,6 +153,8 @@ if 'access_token' in result:
     data = connector.fetch_data()
     save_to_csv(data)
 ```
+IN CASE OF OAUTH2, ONCE OAUTH FLOW CODE IS CREATED, RUN IT
+AND SHOW AUTH URL TO USER SO THAT THEY CAN AUTHORIZE
 
 ### 5. Common Patterns
 - **Pagination**: Implement based on docs (page/offset/cursor)
