@@ -43,6 +43,7 @@ llm = ChatAnthropic(
     model=config.llm_model,
     api_key=st.secrets["ANTHROPIC_API_KEY"],
     max_tokens=20000,
+    temperature=0,
 )
 
 
@@ -80,26 +81,6 @@ tools.append(web_search)
 
 today_date = datetime.datetime.now().isoformat()
 
-
-
-thinking_placeholder = None
-
-def pre_model_hook(state):
-    """Show thinking indicator before LLM call"""
-    global thinking_placeholder
-    if thinking_placeholder is None:
-        thinking_placeholder = st.empty()
-    
-    thinking_placeholder.info("🤔 Agent is thinking...")
-    return state
-
-def post_model_hook(state):
-    """Remove thinking indicator after LLM call"""
-    global thinking_placeholder
-    if thinking_placeholder is not None:
-        thinking_placeholder.empty()
-    return state
-
 def show_csv(file_path: str) -> str:
     """Read and display a CSV data to user
     args:
@@ -109,137 +90,292 @@ def show_csv(file_path: str) -> str:
         import pandas as pd
 
         df = pd.read_csv(file_path)
-        st.dataframe(df)
-        return f"Displayed CSV file: {file_path} with {len(df)} rows."
+        
+        # Store CSV data in session state for display
+        if "csv_data" not in st.session_state:
+            st.session_state["csv_data"] = []
+        
+        st.session_state["csv_data"].append({
+            "path": file_path,
+            "dataframe": df,
+            "timestamp": datetime.datetime.now().strftime("%H:%M:%S")
+        })
+        
+        return f"CSV_DISPLAY:{file_path}:{len(df)} rows"
     except Exception as e:
         return f"Error displaying CSV file {file_path}: {e}"
     
 tools.append(show_csv)
+thinking_placeholder = None
 
-# Create React agent
+def pre_model_hook(state):
+    """Show thinking indicator before LLM call"""
+    st.session_state['processing'] = True
+    return state
+
+def post_model_hook(state):
+    """Remove thinking indicator after LLM call"""
+    st.session_state['processing'] = False
+    return state
+# Create React agent 
 react = create_react_agent(
     llm,
     tools=tools,
     prompt=SYSTEM_PROMPT,
-    pre_model_hook=pre_model_hook,
+        pre_model_hook=pre_model_hook,
     post_model_hook=post_model_hook,
 )
 
 
-def display_tool_output(tool_message: ToolMessage) -> None:
-    """Display for different types of tool outputs."""
-    content = tool_message.content
-    tool_name = tool_message.name
+def should_skip_content(content: str) -> bool:
+    """Check if content should be skipped (raw tool calls, etc.)"""
+    if not isinstance(content, str):
+        return False
+    
+    content_lower = content.lower()
+    return any([
+        "tool_use" in content_lower,
+        content.strip().startswith("[{'id':"),
+        content.strip().startswith("{'id':"),
+        content.strip().startswith("[{\"id\":"),
+        content.strip().startswith("{\"id\":"),
+        len(content) > 500 and content.count("{") > 3 and content.count("}") > 3
+    ])
 
-    # Display for code-related tools
-    if "code" in tool_name.lower() or tool_name in [
-        "create_file",
-        "edit_code",
-        "read_file",
-    ]:
-        if "```python" in content:
-            # Extract and display code blocks specially
-            parts = content.split("```python")
-            for i, part in enumerate(parts):
-                if i == 0:
-                    st.chat_message("assistant").write(part)
-                else:
-                    code_end = part.find("```")
-                    if code_end != -1:
-                        code = part[:code_end]
-                        remaining = part[code_end + 3 :]
-                        st.code(code, language="python")
-                        if remaining.strip():
-                            st.chat_message("assistant").write(remaining)
+
+def format_research_result(content: str) -> tuple[bool, str]:
+    """Format ResearchResult objects nicely"""
+    if "topic=" in content and "key_points=" in content:
+        try:
+            # Extract topic
+            topic_match = re.search(r"topic='([^']*)'", content)
+            if not topic_match:
+                topic_match = re.search(r'topic="([^"]*)"', content)
+            
+            # Extract key points
+            key_points_match = re.search(r"key_points=\[(.*?)\]", content, re.DOTALL)
+            
+            if topic_match and key_points_match:
+                topic = topic_match.group(1)
+                key_points_str = key_points_match.group(1)
+                
+                # Parse key points
+                key_points = []
+                for point in re.findall(r"'([^']*)'", key_points_str):
+                    key_points.append(point)
+                
+                # Format nicely
+                formatted = f"## 🔍 {topic}\n\n"
+                for i, point in enumerate(key_points, 1):
+                    formatted += f"{i}. {point}\n\n"
+                
+                return True, formatted
+        except Exception:
+            pass
+    
+    return False, content
+
+
+def display_message_content(content: str, avatar: str = "🤖"):
+    """Display message content with proper formatting"""
+    if should_skip_content(content):
+        return
+    
+    # Handle CSV display
+    if content.startswith("CSV_DISPLAY:"):
+        parts = content.split(":")
+        if len(parts) >= 3:
+            file_path = parts[1]
+            row_info = parts[2]
+            
+            with st.chat_message("assistant", avatar="📊"):
+                st.markdown(f"**📊 CSV Data: {file_path.split('/')[-1]}**")
+                st.caption(f"📈 {row_info}")
+                
+                # Display the most recent CSV data
+                if "csv_data" in st.session_state and st.session_state["csv_data"]:
+                    latest_csv = st.session_state["csv_data"][-1]
+                    st.dataframe(latest_csv["dataframe"], use_container_width=True)
+                    
+                    # Show basic info
+                    df = latest_csv["dataframe"]
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Rows", len(df))
+                    with col2:
+                        st.metric("Columns", len(df.columns))
+                    with col3:
+                        st.metric("Size", f"{df.memory_usage(deep=True).sum() / 1024:.1f} KB")
+        return
+    
+    # Check if it's a ResearchResult
+    is_research, formatted_content = format_research_result(content)
+    
+    with st.chat_message("assistant", avatar=avatar):
+        if is_research:
+            st.markdown(formatted_content)
+        elif "**" in content or "•" in content or "#" in content:
+            st.markdown(content)
         else:
-            st.chat_message("assistant").write(content)
-
-    # Special handling for todo lists
-    elif "todo" in tool_name.lower():
-        content_formatted = content.replace("\n", "\n\n")
-        st.chat_message("assistant").markdown(content_formatted)
-
-    # Special handling for file listings
-    elif "list" in tool_name.lower() and "file" in tool_name.lower():
-        st.chat_message("assistant").markdown(content)
-
-    # Special handling for web search
-    elif tool_name == "web_search":
-        st.chat_message("assistant").write(content)
-
-    # Default display
-    else:
-        st.chat_message("assistant").write(content)
+            st.write(content)
 
 
-def display_ai_message(message: AIMessage) -> None:
-    """Display for AI messages with better formatting."""
-    try:
-        if isinstance(message.content, list):
-            if len(message.content) == 0:
-                return
-            if "text" in message.content[0]:
-                content = message.content[0]["text"]
-            else:
-                content = str(message.content)
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .main > div {
+        padding-top: 2rem;
+    }
+    
+    .stChatMessage {
+        padding: 1rem;
+        border-radius: 10px;
+        margin-bottom: 1rem;
+    }
+    
+    .welcome-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 2rem;
+        border-radius: 15px;
+        margin-bottom: 2rem;
+        text-align: center;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# App Configuration
+st.set_page_config(
+    page_title="Data Integration Specialist", 
+    page_icon="🔗", 
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Sidebar
+with st.sidebar:
+    st.markdown("### 🔗 Data Integration")
+    st.markdown("---")
+    
+    # Status and thinking indicator
+    status_container = st.container()
+    with status_container:
+        st.markdown("**Agent Status**")
+        if st.session_state.get("processing", False):
+            st.info("🧠 Thinking...")
+            if "current_step" in st.session_state:
+                st.caption(f"⚡ {st.session_state['current_step']}")
         else:
-            content = message.content
+            st.success("✅ Ready")
+    
+    st.markdown("---")
+    
+    st.markdown("**Quick Examples:**")
+    examples = [
+        "Get data from shopify",
+        "Connect to Youtube data", 
+        "Process csv data from google drive",
+        "Get contacts from xero"
+    ]
+    
+    for example in examples:
+        if st.button(example, use_container_width=True):
+            st.session_state["suggested_prompt"] = f"Help me {example.lower()}"
+    
+    st.markdown("---")
+    
+    # Session controls
+    if st.button("🔄 New Session", use_container_width=True):
+        # Keep only the CSV data and suggested prompt if they exist
+        csv_data = st.session_state.get("csv_data", [])
+        suggested_prompt = st.session_state.get("suggested_prompt")
+        
+        # Clear all session state
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+            
+        # Restore what should persist
+        if suggested_prompt:
+            st.session_state["suggested_prompt"] = suggested_prompt
+            
+        st.rerun()
+    
+    # Activity log
+    if st.session_state.get("processing", False):
+        st.markdown("**Recent Activity**")
+        activity_log = st.session_state.get("activity_log", [])
+        for activity in activity_log[-3:]:  # Show last 3 activities
+            st.caption(f"• {activity}")
 
-        # Check for markdown-style content
-        if "**" in content or "•" in content or "#" in content:
-            st.chat_message("assistant").markdown(content)
-        else:
-            st.chat_message("assistant").write(content)
 
-        # Display any code from tool calls
-        if hasattr(message, "tool_calls"):
-            tool_calls = message.tool_calls
-            for tool_call in tool_calls:
-                if tool_call["name"] in ["create_file", "save_code_to_file_in_env"]:
-                    if "code" in tool_call["args"]:
-                        code = tool_call["args"]["code"]
-                        st.code(code, language="python")
-
-    except Exception as e:
-        st.error(f"Error displaying message: {e}")
-        st.write(str(message.content))
-
-
-# Streamlit UI
-st.set_page_config(page_title="Custom Connector Builder", page_icon="🔗", layout="wide")
-
-st.title("Custom Connector Builder")
-
+# Main header
+st.markdown("""
+<div class="welcome-card">
+    <h1>🔗 Data Integration Specialist</h1>
+    <p>Transform any data source into actionable insights with intelligent automation</p>
+</div>
+""", unsafe_allow_html=True)
 
 # Initialize session state
 if "messages" not in st.session_state:
     st.session_state["messages"] = [
         {
             "role": "assistant",
-            "content": "**Custom Connector Builder Ready!**\n\nI can help you extract data from any source with intelligent code management. Just tell me:\n\n• **What data source** you want to connect to (API, database, file, etc.)\n• **What specific data** you need to extract\n• **Any authentication details** you have\n\nI'll use smart file management, automatic error fixing, and complete project tracking!",
+            "content": "**Welcome to Mammoth Integration Specialist!** 🚀\n\nI'm here to help you connect to any data source and extract exactly what you need. Here's how I can assist:\n\n🔌 **Connect to APIs** - REST, GraphQL, webhooks\n🗄️ **Database Integration** - SQL, NoSQL, cloud databases  \n📊 **File Processing** - CSV, JSON, Excel, XML\n🔐 **Authentication** - OAuth, API keys, tokens\n\nJust describe what you want to achieve, and I'll build the solution for you!",
         }
     ]
-
 
 if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = uuid.uuid1().hex
 
+if "processing" not in st.session_state:
+    st.session_state["processing"] = False
 
+if "activity_log" not in st.session_state:
+    st.session_state["activity_log"] = []
 
-#Display chat history
+if "current_step" not in st.session_state:
+    st.session_state["current_step"] = ""
+
+if "csv_data" not in st.session_state:
+    st.session_state["csv_data"] = []
+
+# Display chat history
 for msg in st.session_state.messages:
     if msg["role"] == "user":
-        st.chat_message("user").write(msg["content"])
+        with st.chat_message("user", avatar="👤"):
+            st.write(msg["content"])
     else:
-        if "**" in msg["content"] or "•" in msg["content"]:
-            st.chat_message("assistant").markdown(msg["content"])
-        else:
-            st.chat_message("assistant").write(msg["content"])
+        with st.chat_message("assistant", avatar="🤖"):
+            if "**" in msg["content"] or "•" in msg["content"]:
+                st.markdown(msg["content"])
+            else:
+                st.write(msg["content"])
+
+# Handle suggested prompts from sidebar
+if "suggested_prompt" in st.session_state:
+    prompt = st.session_state["suggested_prompt"]
+    del st.session_state["suggested_prompt"]
+    st.rerun()
 
 # Chat input
-if prompt := st.chat_input("Describe your data integration needs..."):
-    st.chat_message("user").write(prompt)
+if not st.session_state.get("processing", False):
+    prompt = st.chat_input("💬 Describe your data integration needs...", key="main_input")
+else:
+    st.chat_input("💬 Processing... please wait", disabled=True, key="disabled_input")
+    prompt = None
+
+if prompt:
+    # Mark as processing
+    st.session_state["processing"] = True
+    st.session_state["current_step"] = "Analyzing request"
+    st.session_state["activity_log"].append(f"Started: {datetime.datetime.now().strftime('%H:%M:%S')}")
+    
+    # Display user message
+    with st.chat_message("user", avatar="👤"):
+        st.write(prompt)
     st.session_state["messages"].append({"role": "user", "content": prompt})
+    
     # Prepare message history
     msgs = []
     for msg in st.session_state.messages:
@@ -248,14 +384,12 @@ if prompt := st.chat_input("Describe your data integration needs..."):
         else:
             msgs.append(AIMessage(content=msg["content"]))
 
-    msgs.append(HumanMessage(content=prompt))
-
-    # Track displayed messages to avoid duplicates during streaming
-    displayed_message_ids = set()
-    final_assistant_content = []
-
-    # Stream the agent response
+    # Collect all assistant responses
+    all_responses = []
+    step_count = 0
+    
     try:
+        # Stream the agent response
         for output in react.stream(
             input={"messages": msgs},
             config={
@@ -265,43 +399,93 @@ if prompt := st.chat_input("Describe your data integration needs..."):
             stream_mode="values",
         ):
             last_message = output["messages"][-1]
+            print(last_message)
+            step_count += 1
             
-            # Create a unique identifier for the message
-            message_id = getattr(last_message, 'id', None) or hash(str(last_message.content) + str(type(last_message)))
-            
-            # Only display if we haven't seen this message before
-            if message_id not in displayed_message_ids:
-                displayed_message_ids.add(message_id)
+            if isinstance(last_message, AIMessage):
+                st.session_state["current_step"] = "Generating response"
                 
-                print(last_message)
-                if isinstance(last_message, ToolMessage):
-                    display_tool_output(last_message)
-                    # Collect tool outputs for final storage
-                    final_assistant_content.append(last_message.content)
-
-                elif isinstance(last_message, AIMessage):
-                    display_ai_message(last_message)
-
-                    # Collect AI message content for final storage
-                    if isinstance(last_message.content, list):
-                        content = (
-                            last_message.content[0].get("text", str(last_message.content))
-                            if last_message.content
-                            else ""
-                        )
+                if isinstance(last_message.content, list):
+                    content = (
+                        last_message.content[0].get("text", str(last_message.content))
+                        if last_message.content
+                        else ""
+                    )
+                else:
+                    content = last_message.content
+                
+                if content and not should_skip_content(content):
+                    display_message_content(content)
+                    all_responses.append(content)
+            
+            elif isinstance(last_message, ToolMessage):
+                # Update step based on tool being used
+                tool_name = last_message.name
+                if "todo" in tool_name.lower():
+                    st.session_state["current_step"] = "Managing tasks"
+                elif "web_search" in tool_name.lower():
+                    st.session_state["current_step"] = "Searching web"
+                elif "file" in tool_name.lower() or "csv" in tool_name.lower():
+                    st.session_state["current_step"] = "Processing files"
+                else:
+                    st.session_state["current_step"] = f"Using {tool_name}"
+                
+                st.session_state["activity_log"].append(f"Tool: {tool_name}")
+                
+                content = last_message.content
+                if content and not should_skip_content(content):
+                    # Special handling for different tool types
+                    if "todo" in last_message.name.lower():
+                        if "Created todo" in content or "Marked" in content:
+                            with st.chat_message("assistant", avatar="✅"):
+                                st.success(content)
+                            all_responses.append(content)
+                    elif "web_search" in last_message.name.lower():
+                        display_message_content(content, "🔍")
+                        all_responses.append(content)
+                    elif "show_csv" in last_message.name.lower() or content.startswith("CSV_DISPLAY:"):
+                        display_message_content(content, "📊")
+                        all_responses.append(content)
+                    elif any(keyword in last_message.name.lower() for keyword in ["file", "code"]):
+                        display_message_content(content, "📁")
+                        all_responses.append(content)
                     else:
-                        content = last_message.content
-
-                    if content:  # Only collect non-empty content
-                        final_assistant_content.append(content)
-
-        # Store final assistant response in session state (only once after streaming)
-        if final_assistant_content:
-            combined_content = "\n\n".join(final_assistant_content)
-            st.session_state.messages.append(
-                {"role": "assistant", "content": combined_content}
-            )
-
+                        display_message_content(content)
+                        all_responses.append(content)
+    
     except Exception as e:
-        st.error(f"Error during agent execution: {e}")
-        st.error(f"Full traceback: {traceback.format_exc()}")
+        st.session_state["current_step"] = "Error occurred"
+        st.session_state["activity_log"].append(f"Error: {str(e)[:50]}...")
+        
+        with st.chat_message("assistant", avatar="❌"):
+            st.error(f"Something went wrong: {str(e)}")
+            with st.expander("Technical Details"):
+                st.code(traceback.format_exc())
+        all_responses.append(f"Error: {str(e)}")
+    
+    finally:
+        # Clear processing indicator and state
+        st.session_state["processing"] = False
+        st.session_state["current_step"] = ""
+        st.session_state["activity_log"].append(f"Completed: {datetime.datetime.now().strftime('%H:%M:%S')}")
+        
+        # Keep activity log manageable
+        if len(st.session_state["activity_log"]) > 10:
+            st.session_state["activity_log"] = st.session_state["activity_log"][-10:]
+        
+        # Store combined response in session state
+        if all_responses:
+            combined_response = "\n\n".join(all_responses)
+            st.session_state["messages"].append({
+                "role": "assistant", 
+                "content": combined_response
+            })
+        
+        st.rerun()
+
+# Footer
+st.markdown("---")
+st.markdown(
+    "<div style='text-align: center; color: #666; font-size: 0.8rem;'>💡 Tip: Be specific about your data source and requirements for best results</div>", 
+    unsafe_allow_html=True
+)

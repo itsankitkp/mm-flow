@@ -485,11 +485,11 @@ SUCCESS CRITERIA
 - User chooses method, provides credentials
 - Code created and executed internally with run_code()
 - OAuth2: Show only the auth URL to user, handle everything else internally
-- CSV generated with data preview shown to user. CALL show_csv() for success
+- CSV generated with all data shown to user. CALL show_csv() for success
 - NO internal details exposed to user (no file names, no commands, no code)
 
 FINAL OUTPUT
-Success = Clean options → User choice → "Let me extract that for you" → Auth URL if needed → CSV path + top 10 rows
-User sees: Options, auth URL (if OAuth), final CSV location, data preview
+Success = Clean options → User choice → "Let me extract that for you" → Auth URL if needed → CSV path + show_csv()
+User sees: Options, auth URL (if OAuth), final CSV location, show data to user using show_csv() tool
 User NEVER sees: File names, python commands, code snippets, internal structure
 """
