@@ -9,6 +9,7 @@ import traceback
 import datetime
 import re
 import uuid
+import os
 from typing import Dict, Any, List
 import streamlit as st
 from langchain_openai import ChatOpenAI
@@ -81,6 +82,51 @@ tools.append(web_search)
 
 today_date = datetime.datetime.now().isoformat()
 
+def should_skip_content(content: str) -> bool:
+    """Check if content should be skipped (raw tool calls, etc.)"""
+    if not isinstance(content, str):
+        return False
+    
+    content_lower = content.lower()
+    return any([
+        "tool_use" in content_lower,
+        content.strip().startswith("[{'id':"),
+        content.strip().startswith("{'id':"),
+        content.strip().startswith("[{\"id\":"),
+        content.strip().startswith("{\"id\":"),
+        len(content) > 500 and content.count("{") > 3 and content.count("}") > 3,
+        "'type': 'tool_use'" in content,
+        '"type": "tool_use"' in content
+    ])
+
+# Track CSV files created by the agent
+def track_csv_file(file_path: str):
+    """Track CSV files created by the agent for sidebar display"""
+    if "csv_files" not in st.session_state:
+        st.session_state["csv_files"] = []
+    
+    if file_path not in [f["path"] for f in st.session_state["csv_files"]]:
+        file_name = os.path.basename(file_path)
+        st.session_state["csv_files"].append({
+            "path": file_path,
+            "name": file_name,
+            "created_at": datetime.datetime.now().strftime("%H:%M:%S")
+        })
+
+def scan_for_csv_files(content: str):
+    """Scan tool output content for CSV file paths and track them"""
+    if not isinstance(content, str):
+        return
+        
+    # Look for patterns like /tmp/.../*.csv or any path ending with .csv
+    csv_path_pattern = r'(/tmp/[^/\s]+/[^/\s]*\.csv|/[^/\s]+/[^/\s]*\.csv|[^/\s]+\.csv)'
+    matches = re.findall(csv_path_pattern, content)
+    
+    for match in matches:
+        # Only track if the file actually exists
+        if os.path.exists(match):
+            track_csv_file(match)
+
 def show_csv(file_path: str) -> str:
     """Read and display a CSV data to user
     args:
@@ -90,6 +136,9 @@ def show_csv(file_path: str) -> str:
         import pandas as pd
 
         df = pd.read_csv(file_path)
+        
+        # Track the CSV file for sidebar
+        track_csv_file(file_path)
         
         # Store CSV data in session state for display
         if "csv_data" not in st.session_state:
@@ -106,41 +155,30 @@ def show_csv(file_path: str) -> str:
         return f"Error displaying CSV file {file_path}: {e}"
     
 tools.append(show_csv)
+
 thinking_placeholder = None
 
 def pre_model_hook(state):
     """Show thinking indicator before LLM call"""
     st.session_state['processing'] = True
+    st.session_state['current_step'] = "Agent is reasoning..."
+    st.session_state['activity_log'].append(f"Thinking: {datetime.datetime.now().strftime('%H:%M:%S')}")
     return state
 
 def post_model_hook(state):
     """Remove thinking indicator after LLM call"""
-    st.session_state['processing'] = False
+    st.session_state['processing'] = False  # Set back to False
+    st.session_state['current_step'] = "Processing response..."
     return state
+
 # Create React agent 
 react = create_react_agent(
     llm,
     tools=tools,
     prompt=SYSTEM_PROMPT,
-        pre_model_hook=pre_model_hook,
+    pre_model_hook=pre_model_hook,
     post_model_hook=post_model_hook,
 )
-
-
-def should_skip_content(content: str) -> bool:
-    """Check if content should be skipped (raw tool calls, etc.)"""
-    if not isinstance(content, str):
-        return False
-    
-    content_lower = content.lower()
-    return any([
-        "tool_use" in content_lower,
-        content.strip().startswith("[{'id':"),
-        content.strip().startswith("{'id':"),
-        content.strip().startswith("[{\"id\":"),
-        content.strip().startswith("{\"id\":"),
-        len(content) > 500 and content.count("{") > 3 and content.count("}") > 3
-    ])
 
 
 def format_research_result(content: str) -> tuple[bool, str]:
@@ -164,10 +202,15 @@ def format_research_result(content: str) -> tuple[bool, str]:
                 for point in re.findall(r"'([^']*)'", key_points_str):
                     key_points.append(point)
                 
-                # Format nicely
-                formatted = f"## 🔍 {topic}\n\n"
+                # Format nicely with better styling
+                formatted = f"""
+### 🔍 Research Results: {topic}
+
+"""
                 for i, point in enumerate(key_points, 1):
-                    formatted += f"{i}. {point}\n\n"
+                    formatted += f"**{i}.** {point}\n\n"
+                
+                formatted += "---\n"
                 
                 return True, formatted
         except Exception:
@@ -192,20 +235,44 @@ def display_message_content(content: str, avatar: str = "🤖"):
                 st.markdown(f"**📊 CSV Data: {file_path.split('/')[-1]}**")
                 st.caption(f"📈 {row_info}")
                 
-                # Display the most recent CSV data
-                if "csv_data" in st.session_state and st.session_state["csv_data"]:
-                    latest_csv = st.session_state["csv_data"][-1]
-                    st.dataframe(latest_csv["dataframe"], use_container_width=True)
-                    
-                    # Show basic info
-                    df = latest_csv["dataframe"]
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Rows", len(df))
-                    with col2:
-                        st.metric("Columns", len(df.columns))
-                    with col3:
-                        st.metric("Size", f"{df.memory_usage(deep=True).sum() / 1024:.1f} KB")
+                # Find and display the matching CSV data
+                csv_found = False
+                if "csv_data" in st.session_state:
+                    for csv_item in st.session_state["csv_data"]:
+                        if csv_item["path"] == file_path:
+                            st.dataframe(csv_item["dataframe"], use_container_width=True)
+                            
+                            # Show basic info
+                            df = csv_item["dataframe"]
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Rows", len(df))
+                            with col2:
+                                st.metric("Columns", len(df.columns))
+                            with col3:
+                                st.metric("Size", f"{df.memory_usage(deep=True).sum() / 1024:.1f} KB")
+                            csv_found = True
+                            break
+                
+                # If CSV data not found in session state, try to read directly
+                if not csv_found and os.path.exists(file_path):
+                    try:
+                        import pandas as pd
+                        df = pd.read_csv(file_path)
+                        st.dataframe(df, use_container_width=True)
+                        
+                        # Show basic info
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Rows", len(df))
+                        with col2:
+                            st.metric("Columns", len(df.columns))
+                        with col3:
+                            st.metric("Size", f"{df.memory_usage(deep=True).sum() / 1024:.1f} KB")
+                    except Exception as e:
+                        st.error(f"Could not display CSV: {e}")
+                elif not csv_found:
+                    st.warning("CSV data not found")
         return
     
     # Check if it's a ResearchResult
@@ -241,6 +308,24 @@ st.markdown("""
         margin-bottom: 2rem;
         text-align: center;
     }
+    
+    .csv-file-card {
+        background-color: #f8f9fa;
+        padding: 0.5rem;
+        border-radius: 8px;
+        margin-bottom: 0.5rem;
+        border-left: 3px solid #28a745;
+    }
+    
+    .csv-empty-state {
+        background-color: #2d3748;
+        border: 1px dashed #4a5568;
+        border-radius: 8px;
+        padding: 1rem;
+        text-align: center;
+        color: #a0aec0;
+        margin-bottom: 0.5rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -252,21 +337,88 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Sidebar
+# Sidebar with dynamic status container
+sidebar_status_container = st.sidebar.empty()
+
 with st.sidebar:
     st.markdown("### 🔗 Data Integration")
     st.markdown("---")
     
-    # Status and thinking indicator
-    status_container = st.container()
-    with status_container:
+    # Session controls at the top
+    if st.button("🔄 New Session", use_container_width=True):
+        # Keep only the CSV data and suggested prompt if they exist
+        csv_data = st.session_state.get("csv_data", [])
+        suggested_prompt = st.session_state.get("suggested_prompt")
+        
+        # Clear all session state
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+            
+        # Restore what should persist
+        if suggested_prompt:
+            st.session_state["suggested_prompt"] = suggested_prompt
+            
+        st.rerun()
+    
+    st.markdown("---")
+    
+    # Status and thinking indicator - using dynamic container
+    with sidebar_status_container.container():
         st.markdown("**Agent Status**")
         if st.session_state.get("processing", False):
             st.info("🧠 Thinking...")
-            if "current_step" in st.session_state:
+            if "current_step" in st.session_state and st.session_state["current_step"]:
                 st.caption(f"⚡ {st.session_state['current_step']}")
         else:
             st.success("✅ Ready")
+    
+    st.markdown("---")
+    
+    # CSV Files Section
+    st.markdown("**📊 Generated CSV Files**")
+    
+    # Add a refresh button to re-scan for CSV files
+    if st.button("🔄 Scan for CSV files", use_container_width=True):
+        # Re-scan all messages for CSV files
+        for msg in st.session_state.get("messages", []):
+            if isinstance(msg["content"], str):
+                scan_for_csv_files(msg["content"])
+        st.rerun()
+    
+    if "csv_files" in st.session_state and st.session_state["csv_files"]:
+        for csv_file in st.session_state["csv_files"]:
+            st.markdown(f"""
+            <div class="csv-file-card">
+                <strong>📄 {csv_file['name']}</strong><br>
+                <small>Created: {csv_file['created_at']}</small>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Add download button
+            try:
+                if os.path.exists(csv_file['path']):
+                    with open(csv_file['path'], 'rb') as file:
+                        st.download_button(
+                            label=f"⬇️ Download {csv_file['name']}",
+                            data=file.read(),
+                            file_name=csv_file['name'],
+                            mime='text/csv',
+                            key=f"download_{csv_file['path']}",
+                            use_container_width=True
+                        )
+                else:
+                    st.caption("⚠️ File no longer exists")
+            except Exception as e:
+                st.caption(f"Download not available: {str(e)}")
+            
+            st.markdown("---")
+    else:
+        st.markdown("""
+        <div class="csv-empty-state">
+            📄 No CSV files detected yet<br>
+            <small>Files will appear here when generated</small>
+        </div>
+        """, unsafe_allow_html=True)
     
     st.markdown("---")
     
@@ -283,22 +435,6 @@ with st.sidebar:
             st.session_state["suggested_prompt"] = f"Help me {example.lower()}"
     
     st.markdown("---")
-    
-    # Session controls
-    if st.button("🔄 New Session", use_container_width=True):
-        # Keep only the CSV data and suggested prompt if they exist
-        csv_data = st.session_state.get("csv_data", [])
-        suggested_prompt = st.session_state.get("suggested_prompt")
-        
-        # Clear all session state
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-            
-        # Restore what should persist
-        if suggested_prompt:
-            st.session_state["suggested_prompt"] = suggested_prompt
-            
-        st.rerun()
     
     # Activity log
     if st.session_state.get("processing", False):
@@ -321,7 +457,7 @@ if "messages" not in st.session_state:
     st.session_state["messages"] = [
         {
             "role": "assistant",
-            "content": "**Welcome to Mammoth Integration Specialist!** 🚀\n\nI'm here to help you connect to any data source and extract exactly what you need. Here's how I can assist:\n\n🔌 **Connect to APIs** - REST, GraphQL, webhooks\n🗄️ **Database Integration** - SQL, NoSQL, cloud databases  \n📊 **File Processing** - CSV, JSON, Excel, XML\n🔐 **Authentication** - OAuth, API keys, tokens\n\nJust describe what you want to achieve, and I'll build the solution for you!",
+            "content": "**Welcome to Data Integration Specialist!** 🚀\n\nI'm here to help you connect to any data source and extract exactly what you need. Here's how I can assist:\n\n🔌 **Connect to APIs** - REST, GraphQL, webhooks\n🗄️ **Database Integration** - SQL, NoSQL, cloud databases  \n📊 **File Processing** - CSV, JSON, Excel, XML\n🔐 **Authentication** - OAuth, API keys, tokens\n\nJust describe what you want to achieve, and I'll build the solution for you!",
         }
     ]
 
@@ -339,6 +475,17 @@ if "current_step" not in st.session_state:
 
 if "csv_data" not in st.session_state:
     st.session_state["csv_data"] = []
+
+if "csv_files" not in st.session_state:
+    st.session_state["csv_files"] = []
+
+# Auto-scan for CSV files on page load (only once per session)
+if "initial_csv_scan_done" not in st.session_state:
+    st.session_state["initial_csv_scan_done"] = True
+    # Scan all existing messages for CSV files
+    for msg in st.session_state.get("messages", []):
+        if isinstance(msg["content"], str):
+            scan_for_csv_files(msg["content"])
 
 # Display chat history
 for msg in st.session_state.messages:
@@ -366,10 +513,17 @@ else:
     prompt = None
 
 if prompt:
-    # Mark as processing
+    # Mark as processing immediately to update sidebar
     st.session_state["processing"] = True
     st.session_state["current_step"] = "Analyzing request"
     st.session_state["activity_log"].append(f"Started: {datetime.datetime.now().strftime('%H:%M:%S')}")
+    
+    # Force sidebar refresh by triggering a rerun
+    sidebar_status_container.empty()
+    with sidebar_status_container.container():
+        st.markdown("**Agent Status**")
+        st.info("🧠 Thinking...")
+        st.caption(f"⚡ {st.session_state['current_step']}")
     
     # Display user message
     with st.chat_message("user", avatar="👤"):
@@ -384,9 +538,9 @@ if prompt:
         else:
             msgs.append(AIMessage(content=msg["content"]))
 
-    # Collect all assistant responses
-    all_responses = []
-    step_count = 0
+    # Track displayed messages to avoid duplicates during streaming
+    displayed_message_ids = set()
+    final_assistant_content = []
     
     try:
         # Stream the agent response
@@ -399,59 +553,71 @@ if prompt:
             stream_mode="values",
         ):
             last_message = output["messages"][-1]
-            print(last_message)
-            step_count += 1
             
-            if isinstance(last_message, AIMessage):
-                st.session_state["current_step"] = "Generating response"
-                
-                if isinstance(last_message.content, list):
-                    content = (
-                        last_message.content[0].get("text", str(last_message.content))
-                        if last_message.content
-                        else ""
-                    )
-                else:
-                    content = last_message.content
-                
-                if content and not should_skip_content(content):
-                    display_message_content(content)
-                    all_responses.append(content)
+            # Create a unique identifier for the message
+            message_id = getattr(last_message, 'id', None) or hash(str(last_message.content) + str(type(last_message)))
             
-            elif isinstance(last_message, ToolMessage):
-                # Update step based on tool being used
-                tool_name = last_message.name
-                if "todo" in tool_name.lower():
-                    st.session_state["current_step"] = "Managing tasks"
-                elif "web_search" in tool_name.lower():
-                    st.session_state["current_step"] = "Searching web"
-                elif "file" in tool_name.lower() or "csv" in tool_name.lower():
-                    st.session_state["current_step"] = "Processing files"
-                else:
-                    st.session_state["current_step"] = f"Using {tool_name}"
+            # Only display if we haven't seen this message before
+            if message_id not in displayed_message_ids:
+                displayed_message_ids.add(message_id)
                 
-                st.session_state["activity_log"].append(f"Tool: {tool_name}")
+                print(last_message)
                 
-                content = last_message.content
-                if content and not should_skip_content(content):
-                    # Special handling for different tool types
-                    if "todo" in last_message.name.lower():
-                        if "Created todo" in content or "Marked" in content:
-                            with st.chat_message("assistant", avatar="✅"):
-                                st.success(content)
-                            all_responses.append(content)
-                    elif "web_search" in last_message.name.lower():
-                        display_message_content(content, "🔍")
-                        all_responses.append(content)
-                    elif "show_csv" in last_message.name.lower() or content.startswith("CSV_DISPLAY:"):
-                        display_message_content(content, "📊")
-                        all_responses.append(content)
-                    elif any(keyword in last_message.name.lower() for keyword in ["file", "code"]):
-                        display_message_content(content, "📁")
-                        all_responses.append(content)
+                if isinstance(last_message, AIMessage):
+                    st.session_state["current_step"] = "Generating response"
+                    
+                    if isinstance(last_message.content, list):
+                        content = (
+                            last_message.content[0].get("text", str(last_message.content))
+                            if last_message.content
+                            else ""
+                        )
                     else:
+                        content = last_message.content
+                    
+                    if content and not should_skip_content(content):
                         display_message_content(content)
-                        all_responses.append(content)
+                        final_assistant_content.append(content)
+                        # Real-time CSV scanning
+                        scan_for_csv_files(content)
+                
+                elif isinstance(last_message, ToolMessage):
+                    # Update step based on tool being used
+                    tool_name = last_message.name
+                    if "todo" in tool_name.lower():
+                        st.session_state["current_step"] = "Managing tasks"
+                    elif "web_search" in tool_name.lower():
+                        st.session_state["current_step"] = "Searching web"
+                    elif "file" in tool_name.lower() or "csv" in tool_name.lower():
+                        st.session_state["current_step"] = "Processing files"
+                    else:
+                        st.session_state["current_step"] = f"Using {tool_name}"
+                    
+                    st.session_state["activity_log"].append(f"Tool: {tool_name}")
+                    
+                    content = last_message.content
+                    if content and not should_skip_content(content):
+                        # Special handling for different tool types
+                        if "todo" in last_message.name.lower():
+                            if "Created todo" in content or "Marked" in content:
+                                with st.chat_message("assistant", avatar="✅"):
+                                    st.success(content)
+                                final_assistant_content.append(content)
+                        elif "web_search" in last_message.name.lower():
+                            display_message_content(content, "🔍")
+                            final_assistant_content.append(content)
+                        elif "show_csv" in last_message.name.lower() or content.startswith("CSV_DISPLAY:"):
+                            display_message_content(content, "📊")
+                            final_assistant_content.append(content)
+                        elif any(keyword in last_message.name.lower() for keyword in ["file", "code"]):
+                            display_message_content(content, "📁")
+                            final_assistant_content.append(content)
+                        else:
+                            display_message_content(content)
+                            final_assistant_content.append(content)
+                        
+                        # Real-time CSV scanning
+                        scan_for_csv_files(content)
     
     except Exception as e:
         st.session_state["current_step"] = "Error occurred"
@@ -461,7 +627,7 @@ if prompt:
             st.error(f"Something went wrong: {str(e)}")
             with st.expander("Technical Details"):
                 st.code(traceback.format_exc())
-        all_responses.append(f"Error: {str(e)}")
+        final_assistant_content.append(f"Error: {str(e)}")
     
     finally:
         # Clear processing indicator and state
@@ -473,13 +639,12 @@ if prompt:
         if len(st.session_state["activity_log"]) > 10:
             st.session_state["activity_log"] = st.session_state["activity_log"][-10:]
         
-        # Store combined response in session state
-        if all_responses:
-            combined_response = "\n\n".join(all_responses)
-            st.session_state["messages"].append({
-                "role": "assistant", 
-                "content": combined_response
-            })
+        # Store final assistant response in session state (only once after streaming)
+        if final_assistant_content:
+            combined_content = "\n\n".join(final_assistant_content)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": combined_content}
+            )
         
         st.rerun()
 
