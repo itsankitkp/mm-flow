@@ -707,12 +707,12 @@ if prompt:
                         ):
                             display_message_content(content, "📊")
                             final_assistant_content.append(content)
-                        elif any(
-                            keyword in last_message.name.lower()
-                            for keyword in ["file", "code"]
-                        ):
-                            display_message_content(content, "📁")
-                            final_assistant_content.append(content)
+                        # elif any(
+                        #     keyword in last_message.name.lower()
+                        #     for keyword in ["file", "code"]
+                        # ):
+                        #     display_message_content(content, "📁")
+                        #     final_assistant_content.append(content)
                         else:
                             display_message_content(content)
                             final_assistant_content.append(content)

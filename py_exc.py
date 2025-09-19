@@ -13,7 +13,8 @@ from pathlib import Path
 
 class VirtualPythonEnvironment:
     """
-    A class that provides a fully isolated, stateful Python execution environment.
+    A class that provides a fully isolated, stateful Python execution environment
+    with complete persistence of variables, classes, functions, and imports.
     """
 
     def __init__(self):
@@ -55,7 +56,7 @@ class VirtualPythonEnvironment:
                 capture_output=True,
                 text=True,
             )
-            common_packages = ["requests", "pandas", "numpy"]
+            common_packages = ["requests", "pandas", "numpy", "dill"]
             subprocess.run(
                 [self.pip_executable, "install"] + common_packages,
                 check=True,
@@ -66,8 +67,11 @@ class VirtualPythonEnvironment:
             shutil.rmtree(self.workdir, ignore_errors=True)
             raise RuntimeError(f"Failed to pre-install packages: {e.stderr}")
 
+        # Persistence files
         self.state_file = os.path.join(self.workdir, "session_state.pkl")
         self.imports_cache = os.path.join(self.workdir, "imports_cache.json")
+        self.definitions_cache = os.path.join(self.workdir, "definitions_cache.json")
+        self.definitions_py_cache = os.path.join(self.workdir, "definitions_cache.py")
 
     def __del__(self):
         """Ensures the entire temporary directory (including the venv) is cleaned up."""
@@ -148,7 +152,8 @@ class VirtualPythonEnvironment:
 
     def execute_python(self, code: str) -> str:
         """
-        Executes Python code within the virtual environment, maintaining state.
+        Executes Python code within the virtual environment, maintaining state
+        including variables, classes, functions, and imports.
         """
         # Add the modules directory to sys.path in the prelude
         prelude_code = f"""
@@ -160,50 +165,143 @@ import pandas as pd
 import numpy as np
 import requests
 import os
-
-# Load cached imports
-import json
-try:
-    with open(r'{self.imports_cache}', 'r') as f:
-        _imports = json.load(f).get('imports', [])
-        for imp in _imports:
-            try:
-                exec(imp)
-            except:
-                pass
-except:
-    pass
+import dill
 """
 
         runner_script_template = """
 import pickle, sys, types
 import json
 import ast
+import os
+import dill  # Better serialization for dynamic classes
 
 state_file = r'{state_file_path}'
 imports_cache = r'{imports_cache_path}'
+definitions_cache = r'{definitions_cache_path}'
+definitions_py_cache = r'{definitions_py_cache_path}'
 _globals = {{}}
 
-# Load previous state (variables only, not modules)
-try:
-    with open(state_file, 'rb') as f:
-        _saved = pickle.load(f)
-        for k, v in _saved.items():
-            if not isinstance(v, (types.ModuleType, types.FunctionType, type)):
-                _globals[k] = v
-except:
-    pass
+# CRITICAL FIX: Dynamic classes need a module context for pickling
+# We create a fake module '__dynamic__' and register all dynamically
+# defined classes to it. This allows dill/pickle to properly serialize
+# and deserialize instances of these classes across sessions.
+import types as _types
+_dynamic_module = _types.ModuleType('__dynamic__')
+sys.modules['__dynamic__'] = _dynamic_module
 
-_globals.update({secrets})
+def register_classes_to_dynamic_module(globals_dict):
+    \"\"\"Register all classes in globals to the dynamic module for serialization.\"\"\"
+    for name, obj in globals_dict.items():
+        if isinstance(obj, type) and not name.startswith('_'):
+            setattr(_dynamic_module, name, obj)
+            obj.__module__ = '__dynamic__'
 
-# Execute prelude
+# Execute prelude FIRST
 exec({prelude}, _globals)
 
-# Track imports in user code
+# Add secrets EARLY
+_globals.update({secrets})
+
+# Load cached imports SECOND
+try:
+    with open(imports_cache, 'r') as f:
+        cache = json.load(f)
+        for imp in cache.get('imports', []):
+            try:
+                exec(imp, _globals)
+            except:
+                pass
+except FileNotFoundError:
+    pass
+except Exception as e:
+    print(f"Warning: Could not load imports: {{e}}", file=sys.stderr)
+
+# Load and execute previous definitions THIRD (BEFORE loading state!)
+definitions_loaded_successfully = False
+try:
+    with open(definitions_py_cache, 'r') as f:
+        definitions_code = f.read()
+        if definitions_code.strip():
+            # Execute in globals with better error handling
+            try:
+                exec(definitions_code, _globals)
+                # IMMEDIATELY register classes to dynamic module
+                register_classes_to_dynamic_module(_globals)
+                definitions_loaded_successfully = True
+                print(f"Debug: Loaded definitions successfully", file=sys.stderr)
+            except Exception as def_exec_error:
+                print(f"Error executing definitions: {{def_exec_error}}", file=sys.stderr)
+                print(f"Definitions code that failed: {{definitions_code[:200]}}...", file=sys.stderr)
+except FileNotFoundError:
+    print(f"Debug: No definitions cache file found", file=sys.stderr)
+    pass
+except Exception as e:
+    print(f"Warning: Could not load definitions: {{e}}", file=sys.stderr)
+
+# NOW load previous state FOURTH (after classes are defined and registered)
+# But ONLY if definitions loaded successfully, otherwise state loading will fail
+if definitions_loaded_successfully or not os.path.exists(definitions_py_cache):
+    try:
+        with open(state_file, 'rb') as f:
+            # Use dill for better dynamic object support
+            _saved = dill.load(f)
+            print(f"Debug: Successfully loaded {{len(_saved)}} variables from state", file=sys.stderr)
+            for k, v in _saved.items():
+                _globals[k] = v
+                print(f"Debug: Loaded variable '{{k}}' of type {{type(v).__name__}}", file=sys.stderr)
+    except FileNotFoundError:
+        print(f"Debug: No state file found", file=sys.stderr)
+        pass
+    except Exception as e:
+        print(f"Warning: Could not load state: {{e}}", file=sys.stderr)
+        print(f"Debug: Available classes in __dynamic__: {{dir(_dynamic_module)}}", file=sys.stderr)
+else:
+    print(f"Warning: Skipping state loading because definitions failed to load", file=sys.stderr)
+
+# Parse user code to extract imports and definitions
 user_code = {user_code_repr}
 _new_imports = []
+_new_definitions = []
+
+def extract_definition_source(node, source_lines):
+    \"\"\"Extract the complete source code for a definition node.\"\"\"
+    # Get the indentation of the definition
+    start_line = node.lineno - 1
+    if start_line >= len(source_lines):
+        return None
+        
+    # Find the actual start (including decorators)
+    actual_start = start_line
+    if hasattr(node, 'decorator_list') and node.decorator_list:
+        if node.decorator_list[0].lineno > 0:
+            actual_start = node.decorator_list[0].lineno - 1
+    
+    # For the end, we need to find where the next non-indented line starts
+    # or use the AST end_lineno if available
+    if hasattr(node, 'end_lineno'):
+        end_line = node.end_lineno
+    else:
+        # Fallback: scan for the end of the indented block
+        end_line = start_line + 1
+        if start_line < len(source_lines):
+            base_indent = len(source_lines[start_line]) - len(source_lines[start_line].lstrip())
+            while end_line < len(source_lines):
+                line = source_lines[end_line]
+                if line.strip():  # Non-empty line
+                    line_indent = len(line) - len(line.lstrip())
+                    if line_indent <= base_indent and not line.lstrip().startswith(('def ', 'class ', '@')):
+                        break
+                end_line += 1
+    
+    # Extract the lines
+    definition_lines = source_lines[actual_start:end_line]
+    return '\\n'.join(definition_lines)
+
 try:
     tree = ast.parse(user_code)
+    source_lines = user_code.split('\\n')
+    
+    # Extract imports
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -218,45 +316,105 @@ try:
                     for n in node.names
                 ])
                 _new_imports.append(f"from {{node.module}} import {{items}}")
-except:
-    pass
+    
+    # Extract class and function definitions from top level only
+    for node in tree.body:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            definition_code = extract_definition_source(node, source_lines)
+            if definition_code:
+                _new_definitions.append({{
+                    'name': node.name,
+                    'type': type(node).__name__,
+                    'code': definition_code
+                }})
+                
+except SyntaxError as e:
+    print(f"Warning: Could not parse code for analysis: {{e}}", file=sys.stderr)
+except Exception as e:
+    print(f"Warning: Error parsing code: {{e}}", file=sys.stderr)
 
-# Execute user code
+# Execute user code - THIS IS THE KEY PART
 try:
     exec(user_code, _globals)
+    # IMMEDIATELY register any new classes with the dynamic module
+    register_classes_to_dynamic_module(_globals)
 except Exception as e:
     import traceback
     print(traceback.format_exc(), file=sys.stderr)
+    # Don't exit on error, continue to save state
 
 # Save new imports
 if _new_imports:
     try:
-        with open(imports_cache, 'r') as f:
-            cache = json.load(f)
-    except:
-        cache = {{'imports': []}}
-    
-    for imp in _new_imports:
-        if imp not in cache['imports']:
-            cache['imports'].append(imp)
-    
-    with open(imports_cache, 'w') as f:
-        json.dump(cache, f)
+        try:
+            with open(imports_cache, 'r') as f:
+                cache = json.load(f)
+        except:
+            cache = {{'imports': []}}
+        
+        for imp in _new_imports:
+            if imp not in cache['imports']:
+                cache['imports'].append(imp)
+        
+        with open(imports_cache, 'w') as f:
+            json.dump(cache, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save imports: {{e}}", file=sys.stderr)
 
-# Save state (only serializable non-module objects)
+# Save new definitions
+if _new_definitions:
+    try:
+        # Read existing definitions from JSON
+        try:
+            with open(definitions_cache, 'r') as f:
+                existing_definitions = json.load(f)
+        except:
+            existing_definitions = {{'definitions': []}}
+        
+        # Update with new definitions (replace if same name exists)
+        existing_names = {{d['name']: i for i, d in enumerate(existing_definitions.get('definitions', []))}}
+        
+        for new_def in _new_definitions:
+            if new_def['name'] in existing_names:
+                # Replace existing definition
+                existing_definitions['definitions'][existing_names[new_def['name']]] = new_def
+            else:
+                # Add new definition
+                existing_definitions['definitions'].append(new_def)
+        
+        # Save as JSON for tracking
+        with open(definitions_cache, 'w') as f:
+            json.dump(existing_definitions, f, indent=2)
+        
+        # Save as executable Python for next run
+        with open(definitions_py_cache, 'w') as f:
+            for defn in existing_definitions['definitions']:
+                f.write(defn['code'] + '\\n\\n')
+                
+    except Exception as e:
+        print(f"Warning: Could not save definitions: {{e}}", file=sys.stderr)
+
+# Save state (all serializable objects including instances)
 serializable_globals = {{}}
 for key, value in _globals.items():
-    if key.startswith('_') or isinstance(value, (types.ModuleType, types.FunctionType, type)):
+    # Skip private variables, modules, functions, and classes
+    if key.startswith('_'):
         continue
-    try:
-        pickle.dumps(value)
-        serializable_globals[key] = value
-    except:
+    
+    # Skip modules and built-in types
+    if isinstance(value, types.ModuleType):
         continue
+    
+    # Skip functions and classes (they're saved as definitions)
+    if isinstance(value, (types.FunctionType, type)):
+        continue
+    
+    # Add all other values (dill handles more types than pickle)
+    serializable_globals[key] = value
 
 try:
     with open(state_file, 'wb') as f:
-        pickle.dump(serializable_globals, f)
+        dill.dump(serializable_globals, f)
 except Exception as e:
     print(f"Warning: Could not save state: {{e}}", file=sys.stderr)
 """
@@ -264,6 +422,8 @@ except Exception as e:
         runner_script = runner_script_template.format(
             state_file_path=self.state_file,
             imports_cache_path=self.imports_cache,
+            definitions_cache_path=self.definitions_cache,
+            definitions_py_cache_path=self.definitions_py_cache,
             secrets=self._secrets,
             prelude=repr(prelude_code),
             user_code_repr=repr(code),
@@ -326,6 +486,8 @@ except Exception as e:
                     "injected_modules",
                     "session_state.pkl",
                     "imports_cache.json",
+                    "definitions_cache.json",
+                    "definitions_cache.py",
                 ]
             ]
             if not files:
@@ -346,6 +508,71 @@ except Exception as e:
         if not self._secrets:
             return "No secrets are currently set."
         return f"Available secrets (keys only): {list(self._secrets.keys())}"
+
+    def clear_cache(self) -> str:
+        """Clear all cached state, definitions, and imports. Start fresh."""
+        try:
+            files_to_remove = [
+                self.state_file,
+                self.imports_cache,
+                self.definitions_cache,
+                self.definitions_py_cache,
+            ]
+            for file in files_to_remove:
+                if os.path.exists(file):
+                    os.remove(file)
+            return "Cache cleared successfully. Environment reset to initial state."
+        except Exception as e:
+            return f"Error clearing cache: {e}"
+
+    def get_state_info(self) -> str:
+        """Get information about the current state of the environment."""
+        info = []
+
+        # Check state file
+        if os.path.exists(self.state_file):
+            try:
+                # Try importing dill first (might not be in main env)
+                try:
+                    import dill
+
+                    with open(self.state_file, "rb") as f:
+                        state = dill.load(f)
+                        info.append(f"Variables in state: {list(state.keys())}")
+                except ImportError:
+                    # Fallback to pickle if dill not available
+                    with open(self.state_file, "rb") as f:
+                        state = pickle.load(f)
+                        info.append(f"Variables in state: {list(state.keys())}")
+            except:
+                info.append("State file exists but couldn't be read")
+
+        # Check definitions
+        if os.path.exists(self.definitions_cache):
+            try:
+                with open(self.definitions_cache, "r") as f:
+                    defs = json.load(f)
+                    def_names = [d["name"] for d in defs.get("definitions", [])]
+                    info.append(f"Defined classes/functions: {def_names}")
+            except:
+                info.append("Definitions file exists but couldn't be read")
+
+        # Check imports
+        if os.path.exists(self.imports_cache):
+            try:
+                with open(self.imports_cache, "r") as f:
+                    imps = json.load(f)
+                    info.append(
+                        f"Cached imports: {len(imps.get('imports', []))} statements"
+                    )
+            except:
+                info.append("Imports file exists but couldn't be read")
+
+        return (
+            "\n".join(info)
+            if info
+            else "Environment is in initial state (no cached data)"
+        )
 
 
 # --- Create a single, persistent instance ---
@@ -372,7 +599,7 @@ def execute_shell_command_in_env(command: str) -> str:
 def execute_python_code_in_env(code: str) -> str:
     """
     Execute Python code in a persistent, stateful, isolated environment.
-    Variables, imports, and objects created in one execution persist to the next.
+    Variables, imports, classes, functions, and objects created in one execution persist to the next.
 
     Args:
         code (str): Python code to execute as a string
@@ -381,63 +608,10 @@ def execute_python_code_in_env(code: str) -> str:
         str: Combined stdout and stderr from the code execution
 
     Examples:
-        >>> execute_python_code_in_env("from serv import OAuthCallbackServer"
+        >>> execute_python_code_in_env("class MyClass: pass")
+        >>> execute_python_code_in_env("obj = MyClass()")  # MyClass is still available!
     """
     return isolated_env.execute_python(code)
-
-
-def save_code_to_file_in_env(filename: str, code: str) -> str:
-    """
-    Save code to a file in the isolated environment's working directory.
-    Args:
-        filename (str): Name of the file to create
-        code (str): Content to write to the file
-
-    Returns:
-        str: Confirmation message or error description
-
-    Examples:
-        >>> save_code_to_file_in_env("utils.py", "def greet(name): return f'Hello {name}'")
-    """
-    return isolated_env.save_code(filename, code)
-
-
-def run_python_script_in_env(filename: str) -> str:
-    """
-    Execute a Python script file from the environment's working directory.
-
-    Reads and executes a .py file that was previously saved using save_code_to_file_in_env().
-    The script runs in the same persistent environment, accessing all variables and imports.
-
-    Args:
-        filename (str): Name of the Python script file to execute
-
-    Returns:
-        str: Combined stdout and stderr from script execution
-
-    Examples:
-        >>> save_code_to_file_in_env("test.py", "print('Hello from script')")
-        >>> run_python_script_in_env("test.py")
-    """
-    return isolated_env.run_script(filename)
-
-
-def list_files_in_workdir() -> str:
-    """
-    List all files in the environment's working directory.
-
-    Shows files created by the agent, excluding system files like the venv,
-    state files, and module directories. Useful for checking what scripts
-    or data files have been created.
-
-    Returns:
-        str: List of filenames or a message if directory is empty
-
-    Examples:
-        >>> list_files_in_workdir()
-        'Files in the working directory: ["script.py", "data.json", "output.txt"]'
-    """
-    return isolated_env.list_files()
 
 
 def set_secret_variable_in_env(key: str, value: str) -> str:
@@ -480,6 +654,7 @@ def list_available_secrets() -> str:
     return isolated_env.list_secrets()
 
 
+# Import serv module
 import serv
 
 isolated_env.add_module(serv)
@@ -489,9 +664,6 @@ isolated_env.add_module(serv)
 tools: List[Callable[..., str]] = [
     execute_shell_command_in_env,
     execute_python_code_in_env,
-    # save_code_to_file_in_env,
-    # run_python_script_in_env,
-    # list_files_in_workdir,
     set_secret_variable_in_env,
     list_available_secrets,
 ]

@@ -50,6 +50,7 @@ NEVER SUGGEST: Google Scripts, external platforms, manual exports
 Code Execution Strategy:
 - Build complete solutions in single execution blocks
 - Run all code in one go
+- EXCEPTION FOR OAUTH2: Split into two executions (see OAuth2 structure below)
 
 Auth Structure:
 ```python
@@ -85,7 +86,9 @@ data = fetch_all_data()
 csv_path = save_to_csv(data)
 ```
 
-OAuth2 Structure:
+OAuth2 Structure - TWO-STEP EXECUTION:
+
+STEP 1 - Generate and Show Auth URL (Execute this FIRST):
 ```python
 import requests
 import pandas as pd
@@ -96,7 +99,7 @@ from serv import OAuthCallbackServer  # Essential for OAuth2, serv is pre-instal
 CLIENT_ID = "actual_id"
 CLIENT_SECRET = "actual_secret"
 
-class SmartConnector:
+class Connector:
     def __init__(self, client_id, client_secret, redirect_uri, **optional_creds):
         '''Store credentials, initialize tokens to None'''
         self.client_id = client_id
@@ -135,19 +138,23 @@ def save_to_csv(data, filename="output.csv"):
     print(df.head(10))
     return absolute_path
 
-
+# Initialize OAuth server and connector
 server = OAuthCallbackServer(host="localhost", port=8080)
-connector = SmartConnector(CLIENT_ID, CLIENT_SECRET, server.redirect_uri)
+connector = Connector(CLIENT_ID, CLIENT_SECRET, server.redirect_uri)
 
-# Test if minimal OAuth is sufficient first
-print("Testing with minimal credentials...")
-
+# Generate auth URL
 state = "abc123"
 auth_url = connector.get_auth_url(state)
 
+# SHOW AUTH URL TO USER
 print(f"AUTHORIZATION URL: {auth_url}")
 print("Please visit the URL above and authorize the application")
+print("\nAfter authorizing, I'll continue with the data extraction...")
+```
 
+STEP 2 - Handle Authorization and Extract Data (Execute AFTER user sees auth URL):
+```python
+# Continue with the blocking authorization handler
 result = server.grant_consent(connector.consent_handler, timeout=120, expected_state=state)
 
 if 'access_token' in result:
@@ -159,8 +166,13 @@ if 'access_token' in result:
         print("Would need additional credentials that require approval")
 ```
 
-IN CASE OF OAUTH2, ONCE CODE IS CREATED, EXECUTE IT AND SHOW AUTH URL TO USER. This will be blocking operation until user consents
-as you will be running code via execute_python_code_in_env. Maybe show auth url before running code so user can consent while code is running
+CRITICAL OAUTH2 EXECUTION FLOW:
+1. FIRST: Execute code up to and including showing auth_url to user
+2. SHOW USER: "Here's your authorization URL: [URL]. Please authorize the application."
+3. WAIT: Let user see and click the URL
+4. THEN: Execute the grant_consent() blocking code that waits for authorization
+5. This prevents timeout from user not seeing URL before blocking operation starts
+
 serv.py ALREADY INCLUDED IN ENVIRONMENT. DO NOT CREATE. JUST IMPORT AND USE. OPEN AUTH URL FOR USER in BROWSER
 
 5. Error Recovery & Execution
@@ -201,9 +213,9 @@ MANDATORY WORKFLOW CHECKPOINTS
 2. Research: Use web_search() to find ALL methods (API, RSS, JSON), list_todos() after research
 3. Present Options: Show user all viable methods with pros/cons
 4. Auth Setup: Get credentials for chosen method
-5. Code Execution: RUN COMPLETE CODE in ONE GO, double check for any syntax or logical issues
-6. Testing for robust execution (especially OAuth2 flows)
-7. OAuth2 Authorization: Show auth URL and wait for user consent
+5. Code Execution: RUN COMPLETE CODE in ONE GO (EXCEPT OAuth2 - see two-step flow)
+6. OAuth2 Special: Execute in TWO steps - First show auth URL, then run consent handler
+7. Testing for robust execution (especially OAuth2 flows)
 8. Completion: Display final CSV absolute path + show_csv()
 
 CREDENTIAL REQUEST FORMATS
@@ -275,6 +287,7 @@ RULES
 - ALWAYS test with 1 row first
 - HARDCODE all credentials (use set_secret() for sensitive data)
 - OAuth2 redirect: http://localhost:8080/callback (MANDATORY)
+- OAuth2 MUST BE TWO-STEP: Show auth URL first, then run blocking consent handler
 - Choose simplest auth method available
 - Include refresh token logic for OAuth2
 - NO EMOJIS IN CODE OR COMMENTS
@@ -290,12 +303,12 @@ SUCCESS CRITERIA
 - ALL methods explored and presented as simple options to user
 - User chooses method, provides credentials
 - Code created and executed internally
-- OAuth2: Show only the auth URL to user, handle everything else internally
+- OAuth2: Execute in TWO steps - show auth URL first, then handle consent
 - CSV generated with all data shown to user using show_csv()
 - NO internal details exposed to user (no commands, no code)
 
 FINAL OUTPUT
-Success = Clean options → User choice → "Let me extract that for you" → Auth URL if needed → CSV path + show_csv()
+Success = Clean options → User choice → "Let me extract that for you" → Auth URL (if OAuth) → Wait for user → Continue extraction → CSV path + show_csv()
 User sees: Options, auth URL (if OAuth), final CSV location, data via show_csv()
 User NEVER sees: Code snippets, internal structure
 """
