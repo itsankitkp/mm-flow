@@ -20,9 +20,10 @@ from langchain_anthropic import ChatAnthropic
 from langgraph.prebuilt import create_react_agent
 from langmem.short_term import SummarizationNode, RunningSummary
 from langchain_core.messages.utils import count_tokens_approximately
+from py_exc import tools as TOOLS
 
 
-from tools import SYSTEM_PROMPT, TOOLS
+from tools import SYSTEM_PROMPT
 from todo import TODO_TOOLS, list_todos
 
 tools = TOOLS + TODO_TOOLS
