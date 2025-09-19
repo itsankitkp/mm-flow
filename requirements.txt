@@ -4,4 +4,5 @@ openai
 langchain_core
 langchain_experimental
 langchain_anthropic
+langchain-openai==0.3.33
 langgraph
